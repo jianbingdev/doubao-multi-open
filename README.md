@@ -1,6 +1,6 @@
 # 豆包多开管理器
 
-![version](https://img.shields.io/badge/version-3.0.13-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-3.0.14-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
 
 一个本地豆包（Doubao）多账号管理器：单窗口内嵌多个**常驻豆包页面**，
 切号即显隐切换 —— **毫秒级、不丢状态、所有账号同时在线**。
@@ -86,6 +86,18 @@ doubao-multi-open\
 
 > 依赖安装在本目录 `node_modules\`，npm 下载缓存可通过环境变量
 > `npm_config_cache` / `ELECTRON_CACHE` 自定义位置，实现 C 盘零占用。
+
+### 首次运行报 `Windows cannot find ...electron.exe`
+
+`npm install` 在 `node_modules\electron` 目录已存在时会报 `up to date`，
+并跳过该包的 postinstall，导致 `dist\` 为空、`electron.exe` 永远补不上。
+
+启动脚本已内置兜底：检测到 `dist\electron.exe` 缺失时会自动补跑 `node install.js`。
+若仍然失败，手动执行：
+
+```bash
+cd node_modules/electron && node install.js
+```
 
 ## 克隆与部署
 
