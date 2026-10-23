@@ -99,11 +99,6 @@ doubao-multi-open\
 cd node_modules/electron && node install.js
 ```
 
-## 克隆与部署
-
-`.gitignore` 已排除 `node_modules\`、`userdata\`（含登录凭据！）、`downloads\`、日志等。
-克隆到新机器后：装好 Node.js → `npm install`（或直接双击 bat）→ 运行。
-
 ## 风险须知
 
 工具使用 Chromium 分区会话隔离各账号，行为等同「多人共用一台电脑的浏览器」，
