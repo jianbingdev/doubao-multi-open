@@ -18,8 +18,19 @@ if (-not (Test-Path $exe)) {
     Write-Host '[提示] 依赖未安装, 正在执行 npm install ...'
     & npm install --no-audit --no-fund
 }
+
+# npm 在 node_modules\electron 目录已存在时会报 up to date 并跳过该包的
+# postinstall, 导致 dist\ 为空、electron.exe 永远补不上。显式再跑 install.js 兜底。
 if (-not (Test-Path $exe)) {
-    Write-Host '[错误] electron.exe 仍不存在, 请手动在本目录运行 npm install'
+    Write-Host '[提示] 正在下载 Electron 运行时 ...'
+    $env:ELECTRON_MIRROR = 'https://registry.npmmirror.com/-/binary/electron/'
+    Push-Location (Join-Path $dir 'node_modules\electron')
+    & node install.js
+    Pop-Location
+}
+
+if (-not (Test-Path $exe)) {
+    Write-Host '[错误] Electron 运行时仍缺失, 请手动运行: cd node_modules\electron; node install.js'
     Read-Host '按回车退出'
     exit 1
 }
