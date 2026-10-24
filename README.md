@@ -129,26 +129,35 @@ cd node_modules/electron && node install.js
 
 ## 自动更新
 
-侧栏顶部的版本号徽标就是入口（菜单「帮助 → 检查更新」同效）。
+侧栏顶部的版本号徽标就是入口（菜单「帮助 → 检查更新」，快捷键 `Ctrl+U` 同效）。
 
 - **默认更新源**：本仓库的 GitHub Releases（`releases/latest`）。版本号取 Release 的 tag，
-  安装包取该 Release 下第一个 `.zip` 资产，更新说明取 Release 正文（会自动去掉 Markdown 记号，只显示「本次更新」小节）
+  更新说明取 Release 正文（会自动去掉 Markdown 记号，只显示「本次更新」小节）
+- **挑哪个包**：Release 里同时挂 `*-core.zip`（核心包，几百 KB）和 `*-windows-portable.zip`（完整包，143 MB）。
+  客户端优先挑 `core`，只覆盖 `resources\app\`；找不到核心包才退回完整包
 - **自定义更新源**：弹窗左下「更新源」填自己的地址（留空恢复默认），格式：
 
 ```json
 {
   "version": "4.1",
   "notes": "- 本次更新内容\n- 第二条",
-  "url": "https://你的域名/app-4.1.zip",
-  "size": 14680064,
-  "sha256": "可选，填了就校验，不匹配会中止"
+  "core": {
+    "url": "https://你的域名/app-4.1-core.zip",
+    "size": 485732,
+    "sha256": "可选，填了就校验，不匹配会中止"
+  },
+  "url": "https://你的域名/app-4.1-full.zip"
 }
 ```
 
-- **替换规则**：只覆盖程序文件，`userdata\`、`downloads\`、`profiles\`、`node_modules\` 一律跳过
-- **更新包形态**：整个便携目录（含 exe 与 `resources\`）或纯代码包（只有 js/html）都行，
-  压缩包里多套一层文件夹也能识别
-- **失败排查**：安装目录下的 `update.log` 记了脚本每一步
+  有 `core` 就走增量，没有就下 `url` 走完整覆盖。
+
+- **核心包长什么样**：内部固定是 `resources\app\main.js …` 这一层结构 ——
+  新版据此下钻到 `resources\app` 覆盖；而 v4.0 及更早的客户端只会把整包铺到安装根目录，
+  也正好落到同一位置，所以老用户升级同样只要几百 KB
+- **替换规则**：核心包只覆盖 `resources\app\`；完整包才覆盖整个安装目录，
+  且 `userdata\`、`downloads\`、`profiles\`、`node_modules\` 一律跳过
+- **失败排查**：安装目录下的 `update.log` 记了脚本每一步（含 `mode=core` / `robocopy exit=`）
 
 > 从源码目录（`npm start`）跑的时候不要点自动更新 —— 目标目录就是源码目录，
 > 完整包会把 exe 和一堆 DLL 铺进去。只有便携版适合走自动更新。

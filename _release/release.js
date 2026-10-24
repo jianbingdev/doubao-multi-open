@@ -152,6 +152,24 @@ function bumpVersion(ver) {
 // ---------- 构建便携版 ----------
 const APP_FILES = ['main.js', 'preload.js', 'member-preload.js', 'index.html', 'renderer.js', 'app.ico', 'README.md', 'LICENSE'];
 
+// 清空/删除一个目录。
+// 不能用 fs.rmSync(recursive): 本机安全策略对"单次删除超过 50 个文件"会直接拒绝,
+// 而 build\v<版本> 里有几百个文件, 一重跑就卡住。robocopy 用空目录 /MIR 是等效且稳定的做法。
+function wipeDir(dir) {
+  if (!fs.existsSync(dir)) return;
+  const empty = path.join(require('os').tmpdir(), 'dbmo_empty_' + process.pid + '_' + Date.now());
+  fs.mkdirSync(empty, { recursive: true });
+  const r = spawnSync('robocopy', [empty, dir, '/MIR', '/NFL', '/NDL', '/NJH', '/NJS', '/MT:8'], { stdio: 'ignore' });
+  try {
+    fs.rmdirSync(empty);
+  } catch (e) {}
+  try {
+    fs.rmdirSync(dir); // 内容已空, 顺手把目录本身也去掉
+  } catch (e) {}
+  if (r.error) die('清空目录失败: ' + dir + ' (' + r.error.message + ')');
+  if (r.status !== null && r.status >= 8) die('清空目录失败: ' + dir + ' (robocopy 退出码 ' + r.status + ')');
+}
+
 function buildPortable(ver) {
   const out = path.join(__dirname, 'build', 'v' + ver);
   const dist = path.join(ROOT, 'node_modules', 'electron', 'dist');
@@ -160,7 +178,7 @@ function buildPortable(ver) {
   if (SKIP_BUILD && fs.existsSync(path.join(out, 'DoubaoMultiOpen.exe'))) {
     say(2, '跳过构建, 复用 ' + out);
   } else {
-    fs.rmSync(out, { recursive: true, force: true });
+    wipeDir(out);
     say(2, '复制 Electron 运行时 (约 360 MB, 稍等)…');
     // 必须用 robocopy: fs.cpSync 在这里复制几百 MB 会直接把 node 进程搞崩
     // (Windows 下创建海量文件句柄翻车), robocopy 带 /MT 只要几百毫秒
@@ -188,7 +206,7 @@ function buildPortable(ver) {
 
   // resources\app
   const appDir = path.join(out, 'resources', 'app');
-  fs.rmSync(appDir, { recursive: true, force: true });
+  wipeDir(appDir);
   fs.mkdirSync(appDir, { recursive: true });
   for (const f of APP_FILES) {
     const src = path.join(ROOT, f);
@@ -270,11 +288,44 @@ function dirSize(p) {
 }
 
 // ---------- 压缩 ----------
+// 统一的压缩实现。srcExpr 是给 Compress-Archive 的 -Path 表达式:
+// 传目录 + '\*' 可以保证 zip 顶层直接是文件, 不带一层目录名。
+function compress(srcExpr, zip, label) {
+  if (fs.existsSync(zip)) fs.rmSync(zip, { force: true });
+  // 注意: 不能用 tar -a -cf, 本机 Git Bash 会生成 tar 而不是 zip
+  const ps = path.join(__dirname, '.zip-job.ps1');
+  fs.writeFileSync(
+    ps,
+    '\uFEFF' +
+      [
+        '$ErrorActionPreference = "Stop"',
+        `Compress-Archive -Path '${srcExpr}' -DestinationPath '${zip}' -CompressionLevel Optimal -Force`,
+        '$b = [System.IO.File]::ReadAllBytes("' + zip + '")[0..3]',
+        '"HEAD=" + (($b | ForEach-Object { $_.ToString("x2") }) -join " ")'
+      ].join('\r\n'),
+    'utf8'
+  );
+  say(3, '压缩中 ' + label + '…');
+  // 不要加 -WindowStyle Hidden / windowsHide, 本机上会导致 PowerShell 根本起不来
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps], {
+    stdio: 'inherit'
+  });
+  fs.rmSync(ps, { force: true });
+  if (r.status !== 0) die('压缩失败(' + label + '), 退出码 ' + r.status);
+  if (!fs.existsSync(zip)) die('压缩后找不到 zip: ' + zip);
+
+  const head = fs.readFileSync(zip).slice(0, 4);
+  if (!(head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04)) {
+    die('产物不是有效 ZIP: ' + path.basename(zip) + ' 头字节 = ' + [...head].map((x) => x.toString(16)).join(' '));
+  }
+  say(3, `打包完成: ${path.basename(zip)}  (${(fs.statSync(zip).size / 1024).toFixed(0)} KB)`);
+  return zip;
+}
+
 function zipPortable(srcDir, ver) {
   const distDir = path.join(__dirname, 'dist');
   fs.mkdirSync(distDir, { recursive: true });
   const zip = path.join(distDir, `DoubaoMultiOpen-v${ver}-windows-portable.zip`);
-  if (fs.existsSync(zip)) fs.rmSync(zip, { force: true });
   // 清掉历史包, 避免 dist 里堆一堆
   for (const f of fs.readdirSync(distDir)) {
     if (/\.zip$/i.test(f) && path.join(distDir, f) !== zip) {
@@ -283,34 +334,63 @@ function zipPortable(srcDir, ver) {
       } catch (e) {}
     }
   }
+  return compress(srcDir, zip, '完整便携版');
+}
 
-  // 注意: 不能用 tar -a -cf, 本机 Git Bash 会生成 tar 而不是 zip
-  const ps = path.join(__dirname, '.zip-job.ps1');
-  fs.writeFileSync(
-    ps,
-    '\uFEFF' +
-      [
-        '$ErrorActionPreference = "Stop"',
-        `Compress-Archive -Path '${srcDir}' -DestinationPath '${zip}' -CompressionLevel Optimal -Force`,
-        '$b = [System.IO.File]::ReadAllBytes("' + zip + '")[0..3]',
-        '"HEAD=" + (($b | ForEach-Object { $_.ToString("x2") }) -join " ")'
-      ].join('\r\n'),
-    'utf8'
-  );
-  say(3, '压缩中 (约 1~2 分钟)…');
-  // 不要加 -WindowStyle Hidden / windowsHide, 本机上会导致 PowerShell 根本起不来
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps], {
-    stdio: 'inherit'
-  });
-  fs.rmSync(ps, { force: true });
-  if (r.status !== 0) die('压缩失败, 退出码 ' + r.status);
-  if (!fs.existsSync(zip)) die('压缩后找不到 zip');
+// 精简版 package.json: 只保留运行必需字段
+function leanPackageJson(ver) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  return JSON.stringify(
+    {
+      name: pkg.name,
+      productName: pkg.productName || pkg.name,
+      version: ver,
+      description: pkg.description,
+      author: pkg.author,
+      main: pkg.main,
+      license: pkg.license
+    },
+    null,
+    2
+  ) + '\n';
+}
 
-  const head = fs.readFileSync(zip).slice(0, 4);
-  if (!(head[0] === 0x50 && head[1] === 0x4b && head[2] === 0x03 && head[3] === 0x04)) {
-    die('产物不是有效 ZIP, 头字节 = ' + [...head].map((x) => x.toString(16)).join(' '));
+// ---------- 核心包(自动更新用) ----------
+// 内容 = resources\app 里那几个文件, 几百 KB。
+// 刻意保留 resources\app 这层结构, 原因:
+//   * v4.1+ 认得它, 只覆盖 resources\app, 不动 exe/运行时/userdata
+//   * v4.0 及更早的客户端只会把整包解压后 robocopy 到安装根目录,
+//     有了这层结构, 文件正好落到 resources\app 里 —— 旧版也能一次到位,
+//     不用为了让老客户端升级而下 140 MB 的完整包。
+function zipCore(ver) {
+  const stage = path.join(__dirname, 'build', 'core-v' + ver);
+  wipeDir(stage);
+  const stageApp = path.join(stage, 'resources', 'app');
+  fs.mkdirSync(stageApp, { recursive: true });
+  for (const f of APP_FILES) {
+    const src = path.join(ROOT, f);
+    if (!fs.existsSync(src)) die('缺少应用文件: ' + f);
+    fs.copyFileSync(src, path.join(stageApp, f));
   }
-  say(3, `打包完成: ${path.basename(zip)}  (${(fs.statSync(zip).size / 1024 / 1024).toFixed(1)} MB)`);
+  const docs = path.join(ROOT, 'docs');
+  if (fs.existsSync(docs)) {
+    const out = path.join(stageApp, 'docs');
+    fs.mkdirSync(out, { recursive: true });
+    for (const f of fs.readdirSync(docs)) {
+      const s = path.join(docs, f);
+      if (fs.statSync(s).isFile()) fs.copyFileSync(s, path.join(out, f));
+    }
+  }
+  fs.writeFileSync(path.join(stageApp, 'package.json'), leanPackageJson(ver), 'utf8');
+
+  const distDir = path.join(__dirname, 'dist');
+  fs.mkdirSync(distDir, { recursive: true });
+  const zip = path.join(distDir, `DoubaoMultiOpen-v${ver}-core.zip`);
+  compress(path.join(stage, '*'), zip, '核心包');
+  const kb = fs.statSync(zip).size / 1024;
+  if (kb > 4096) {
+    console.log('   注意: 核心包 ' + kb.toFixed(0) + ' KB, 比预期(几百 KB)大不少, 检查是否混进了无关文件');
+  }
   return zip;
 }
 
@@ -341,24 +421,29 @@ function loadNotes(ver) {
 
 function fullNotes(ver, body) {
   const asset = `DoubaoMultiOpen-v${ver}-windows-portable.zip`;
+  const core = `DoubaoMultiOpen-v${ver}-core.zip`;
   return [
     `> [!IMPORTANT]`,
     `> **该下载哪个？**`,
-    `> - 要**能直接双击运行**的 → 下载 \`${asset}\`（自带 Electron 运行时，解压即用）`,
+    `> - 已经装了旧版的 → **不用手动下载**。打开软件点侧栏顶部版本徽标 → 检查更新，`,
+    `>   它只会拉 \`${core}\`（几百 KB，只替换程序文件，账号不用重新登录）`,
+    `> - 第一次安装 / 想重新装一份干净的 → 下载 \`${asset}\`（自带 Electron 运行时，解压即用）`,
     `> - 名字很像、但只有 **200 KB 左右**的 \`${REPO}-${ver}.zip\` 是 GitHub **自动生成的源码包**，`,
     `>   里面只有 js/html，**没有 exe，不能直接运行**`,
     `>`,
     `> 浏览器若提示「检测到病毒」，是未签名程序的信誉误报（新发布、零下载量），在下载列表点「保留」即可。`,
     '',
-    `## 豆包多开管理器 v${ver}（完整便携版）`,
+    `## 豆包多开管理器 v${ver}`,
     '',
-    `解压到任意目录（**别放 Program Files**），双击文件夹里的 \`启动豆包多开.bat\`。`,
-    `无需安装 Node.js，无需联网装依赖。数据都在同目录的 \`userdata\` 里，整个文件夹可搬迁备份。`,
+    `**从这一版开始改成增量更新**：检查更新只下载核心包（约 200 KB），`,
+    `只覆盖 \`resources\\app\` 里的程序文件，不碰 Electron 运行时、不碰 \`userdata\`。`,
+    `以后每次升级都是几秒钟的事。`,
     '',
     body,
     '',
     '---',
-    `已安装旧版的用户：点侧栏顶部版本徽标 → 检查更新 → 立即更新 → 重启并更新，即可升级。`,
+    `完整便携版：解压到任意目录（**别放 Program Files**），双击 \`启动豆包多开.bat\`。`,
+    `旧版用户（v4.0 及更早）：检查更新会先下一次完整包完成过渡，之后就走增量了。`,
     `更新只覆盖程序文件，跳过 \`userdata\` / \`downloads\` / \`profiles\`，登录态不会丢。`
   ].join('\n');
 }
@@ -425,25 +510,34 @@ async function createRelease(ver, notes, commitSha) {
   return created.json;
 }
 
-async function uploadAsset(release, zipPath) {
-  const name = path.basename(zipPath);
+// 上传顺序: 核心包先传, 完整包后传。
+// 旧客户端(<=v4.0)取的是"第一个 .zip", 让它拿到几百 KB 的核心包 ——
+// 核心包内部是 resources\app 结构, 旧版解压后 robocopy 到安装根目录正好落对位置,
+// 所以老用户升级也不用量 140 MB。新版(v4.1+)则明确按 *-core.zip 名字挑, 顺序无关。
+async function uploadAssets(release, zipPaths) {
   for (const a of release.assets || []) {
     const d = await gh('DELETE', `/repos/${OWNER}/${REPO}/releases/assets/${a.id}`);
     say(6, '删除旧资产 ' + a.name + ' => ' + d.status);
   }
-  const buf = fs.readFileSync(zipPath);
-  const up = await req('POST', 'uploads.github.com', `/repos/${OWNER}/${REPO}/releases/${release.id}/assets?name=${encodeURIComponent(name)}`, {
-    headers: {
-      'User-Agent': 'doubao-release-script',
-      Authorization: 'Bearer ' + TOKEN,
-      Accept: 'application/vnd.github+json',
-      'Content-Type': 'application/zip',
-      'Content-Length': buf.length
-    },
-    body: buf
-  });
-  if (up.status !== 201) die('上传失败: HTTP ' + up.status + ' ' + JSON.stringify(up.json).slice(0, 300));
-  say(6, `上传成功: ${up.json.name}  (${(up.json.size / 1024 / 1024).toFixed(1)} MB)`);
+  const out = [];
+  for (const zipPath of zipPaths) {
+    const name = path.basename(zipPath);
+    const buf = fs.readFileSync(zipPath);
+    const up = await req('POST', 'uploads.github.com', `/repos/${OWNER}/${REPO}/releases/${release.id}/assets?name=${encodeURIComponent(name)}`, {
+      headers: {
+        'User-Agent': 'doubao-release-script',
+        Authorization: 'Bearer ' + TOKEN,
+        Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/zip',
+        'Content-Length': buf.length
+      },
+      body: buf
+    });
+    if (up.status !== 201) die('上传失败: HTTP ' + up.status + ' ' + JSON.stringify(up.json).slice(0, 300));
+    say(6, `上传成功: ${up.json.name}  (${(up.json.size / 1024).toFixed(0)} KB)`);
+    out.push(up.json);
+  }
+  return out;
 }
 
 // ---------- 主流程 ----------
@@ -460,11 +554,13 @@ async function uploadAsset(release, zipPath) {
   bumpVersion(VER);
   const outDir = buildPortable(VER);
   const zipPath = zipPortable(outDir, VER);
+  const corePath = zipCore(VER);
 
   if (DRY) {
     console.log('\n[DRY RUN] 本地构建与打包已完成, 未触碰 GitHub。');
     console.log('  便携版目录: ' + outDir);
-    console.log('  压缩包    : ' + zipPath);
+    console.log('  完整包    : ' + zipPath);
+    console.log('  核心包    : ' + corePath);
     console.log('\n确认无误后去掉 --dry-run 再跑一次即可发布。\n');
     process.exit(0);
   }
@@ -482,13 +578,21 @@ async function uploadAsset(release, zipPath) {
   }
 
   const release = await createRelease(VER, fullNotes(VER, notesBody), commitSha);
-  await uploadAsset(release, zipPath);
+  // 核心包先传, 完整包后传(旧客户端只认第一个 zip)
+  await uploadAssets(release, [corePath, zipPath]);
 
   const latest = await gh('GET', `/repos/${OWNER}/${REPO}/releases/latest`);
   const l = latest.json || {};
   say(7, 'releases/latest => ' + l.tag_name + '  ' + (l.assets || []).map((a) => a.name).join(', '));
   if (l.tag_name !== TAG) {
     console.log('\n注意: latest 仍是 ' + l.tag_name + ', 可能因为该 Release 被标成了草稿/预发布。');
+  }
+  const names = (l.assets || []).map((a) => a.name);
+  if (l.tag_name === TAG) {
+    if (!names.some((n) => /-core\.zip$/i.test(n))) console.log('\n!! 警告: latest 里没有核心包, 客户端会退化成下载完整包。');
+    if (names.length && !/-core\.zip$/i.test(names[0])) {
+      console.log('\n!! 警告: 第一个资产不是核心包(' + names[0] + '), 旧客户端会去下完整包。');
+    }
   }
 
   console.log('\n===== 完成 =====');
