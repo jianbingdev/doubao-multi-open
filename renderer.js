@@ -293,6 +293,50 @@ let currentUpdateUrl = '';
 // idle | checking | none | ready | downloading | downloaded | applying
 let updPhase = 'idle';
 
+// 更新说明来自 Release 正文, 是 Markdown。这里做轻量清洗:
+// 优先只取「本次更新」小节(避免把下载指引、浏览器误报提示一起塞进弹窗),
+// 再去掉 ## > ** ` 之类的记号, 让它在纯文本弹窗里读得下去。
+function formatNotes(raw) {
+  const text = String(raw || '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return '';
+  let lines = text.split('\n');
+
+  const headRe = /^#{1,3}\s*(本次更新|更新内容|更新说明|更新日志|what'?s changed|changes)\s*$/i;
+  const start = lines.findIndex((l) => headRe.test(l.trim()));
+  if (start >= 0) {
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (/^#{1,3}\s+\S/.test(lines[i])) { end = i; break; }
+    }
+    lines = lines.slice(start + 1, end);
+  }
+
+  // 整段丢掉 GitHub 的 > [!IMPORTANT] 提示块和普通引用
+  const kept = [];
+  let inCallout = false;
+  for (const l of lines) {
+    const t = l.trim();
+    if (/^>\s*\[!(IMPORTANT|NOTE|TIP|WARNING|CAUTION)\]/i.test(t)) { inCallout = true; continue; }
+    if (inCallout) { if (/^>/.test(t)) continue; inCallout = false; }
+    if (/^>/.test(t)) continue;
+    kept.push(l);
+  }
+
+  return kept
+    .map((l) =>
+      l
+        .replace(/^#{1,6}\s*/, '')
+        .replace(/^[-*+]\s+/, '· ')
+        .replace(/^\s*---+\s*$/, '')
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+    )
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function updMsg(text, isErr) {
   updMsgEl.textContent = text || '';
   updMsgEl.className = 'upd-msg' + (isErr ? ' err' : '');
@@ -350,7 +394,7 @@ async function runCheck() {
 
   btnUpdate.classList.add('has-new');
   updNotes.hidden = !r.notes;
-  updNotes.textContent = r.notes || '';
+  updNotes.textContent = formatNotes(r.notes);
   updAction.disabled = false;
   if (r.cached) {
     updPhase = 'downloaded';

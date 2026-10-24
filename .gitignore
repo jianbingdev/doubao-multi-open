@@ -12,6 +12,14 @@ profiles/
 # 本地构建产物
 *.exe
 
+# 发版产物(含 100MB+ 的便携包与运行时副本, 绝不入库)
+_release/build/
+_release/dist/
+_release/doubao-multi-open-v*/
+
+# 本地更新测试环境(测试服务/假更新源/回滚备份)
+_update-test/
+
 # 系统文件
 Thumbs.db
 .DS_Store
