@@ -1,6 +1,6 @@
 # 豆包多开管理器
 
-![version](https://img.shields.io/badge/version-3.0.14-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-3.0.16-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
 
 一个本地豆包（Doubao）多账号管理器：单窗口内嵌多个**常驻豆包页面**，
 切号即显隐切换 —— **毫秒级、不丢状态、所有账号同时在线**。
@@ -12,7 +12,7 @@
 
 ## 下载即用（推荐普通用户）
 
-不想装环境，直接去 [Releases](../../releases) 下载 `doubao-multi-open-vX.X.X.zip`，
+不想装环境，直接去 [Releases](../../releases) 下载 `豆包多开管理器-vX.X.X.zip`，
 解压到任意目录（**别放 `C:\Program Files`**），双击 `豆包多开管理器.exe` 就能用：
 
 - **无需安装 Node.js**，无需联网装依赖，运行时已内置
@@ -38,6 +38,8 @@
 - **套餐识别**：账号名旁显示套餐小字，鼠标悬停查看到期时间
 - **跨账号完成提醒**：A 账号发指令后切到 B，A 跑完会在侧栏亮「新回复」并弹提示
 - **视频生成后台等待**：视频任务转入后台，切走也持续跟进，真正生成完成才提示
+- **自动更新**：侧栏顶部的版本号（或「帮助 → 检查更新」）点一下就能检测新版本，
+  有新版本直接下载，下完点「重启并更新」即自动替换并重启，**账号数据不会被覆盖**
 - **稳定性**：渲染进程崩溃自动重建视图；页面加载失败自动重试；单实例锁；记住窗口位置；内置 GPU 沙箱兼容参数
 - **下载处理**：生成的视频/图片自动保存到 `downloads\<账号ID>\` 并弹提示
 - **托盘常驻**：关闭窗口默认最小化到托盘
@@ -99,6 +101,41 @@ doubao-multi-open\
 cd node_modules/electron && node install.js
 ```
 
+## 自动更新
+
+侧栏顶部的版本号徽标就是更新入口（菜单「帮助 → 检查更新」同样可以打开）。
+点开后会做三件事：比对版本 → 下载安装包 → 重启并就地替换。
+
+- **默认更新源**：本仓库的 GitHub Releases（`releases/latest`），版本号取 Release 的 tag，
+  安装包取该 Release 下第一个 `.zip` 资产，更新说明取 Release 正文
+- **自定义更新源**：弹窗左下「更新源」里可以填自己的地址（留空即恢复默认），格式：
+
+```json
+{
+  "version": "3.0.16",
+  "notes": "更新说明，换行用 \\n",
+  "url": "https://你的域名/豆包多开管理器-v3.0.16.zip",
+  "size": 138412345,
+  "sha256": "可选，填了会校验，不匹配就中止"
+}
+```
+
+- **替换规则**：只覆盖程序文件，`userdata\`（登录态）、`downloads\`、`profiles\`、`node_modules\` 一律跳过，
+  所以更新不会掉登录、不会丢生成的视频图片
+- **更新包可以是整个便携目录**（含 exe 与 `resources\`），也可以是纯代码包（只有 js/html）；
+  压缩包里套一层文件夹也能识别
+- **失败排查**：看安装目录下的 `update.log`，脚本每一步都有记录
+
+### 发布新版本（维护者）
+
+1. 改版本号，共 4 处：`package.json`、`package-lock.json`（文件头和 `packages[""]` 各一处）、
+   `README.md` 顶部的 badge。代码里的 `关于` 对话框已改为读 `package.json`，不用再手改
+2. 打出便携版 zip（保持 `豆包多开管理器.exe` 与 `resources\` 同级）
+3. 在 GitHub 建 Release，**tag 必须与 `package.json` 版本一致**（如 `v3.0.16` 或 `3.0.16`）
+4. 把 zip 作为资产上传。客户端下次检查更新即可看到新版本
+
+> 版本号比较只看前三段数字，`v` 前缀会被忽略；只有远端版本**大于**当前版本才会提示。
+
 ## 风险须知
 
 工具使用 Chromium 分区会话隔离各账号，行为等同「多人共用一台电脑的浏览器」，
@@ -111,6 +148,7 @@ cd node_modules/electron && node install.js
 原作者 **牛来智能**，MIT 许可。在此基础上的修改优化包括：
 
 - 新增套餐识别、跨账号完成提醒、视频生成后台等待
+- 新增自动更新（检查版本 → 下载 → 重启就地替换，保留账号数据）
 - 重做在线状态检测（强凭证 Cookie + 手动全量刷新 + 单账号检测）
 - 移除原版的赞赏/收款码模块
 - 内置 GPU 沙箱兼容参数，提供便携版打包

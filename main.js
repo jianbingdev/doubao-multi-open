@@ -12,9 +12,11 @@
 //    7. 权限请求白名单; 关窗最小化到托盘(可关); 单实例锁
 //    8. 登录监控防重入、定时器必清; 昵称提取只在登录成功时执行一次
 // ============================================================
-const { app, BrowserWindow, WebContentsView, ipcMain, Menu, session, shell, Tray, nativeImage, dialog, screen } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu, session, shell, Tray, nativeImage, dialog, screen, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 // v3.0.12: 打包成便携版后没有 bat 帮忙传参数, 而部分机器的 GPU 进程沙箱会被系统策略拦截
 // (表现为连续报 GPU process isn't usable 然后白屏/闪退)。在这里兜底, 双击 exe 即可启动。
@@ -49,7 +51,7 @@ const PREFS_FILE = path.join(USER_DIR, 'prefs.json');
 function loadPrefs() {
   try { return JSON.parse(fs.readFileSync(PREFS_FILE, 'utf-8')); } catch (e) { return {}; }
 }
-let prefs = Object.assign({ closeToTray: true, winBounds: null }, loadPrefs());
+let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '' }, loadPrefs());
 function savePrefs() {
   try {
     fs.mkdirSync(USER_DIR, { recursive: true });
@@ -1308,11 +1310,16 @@ function buildAppMenu() {
       label: '帮助(&H)',
       submenu: [
         {
+          label: '检查更新',
+          click: () => { ShowMain(); pushToRenderer('menu:checkUpdate'); }
+        },
+        { type: 'separator' },
+        {
           label: '关于', click: () => {
             dialog.showMessageBox(mainWindow, {
               type: 'info',
               title: '关于',
-              message: '豆包多开管理器 v3.0.13',
+              message: '豆包多开管理器 v' + APP_VERSION,
               detail: '视图池架构 · 单窗口毫秒级切号\n数据目录: ' + USER_DIR + '\n\n原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。'
             });
           }
@@ -1473,6 +1480,481 @@ ipcMain.handle('downloads:openFolder', () => {
 // (独立窗口 + 悬停预览卡 + 相关 IPC 全部删除, 收款码图片也已清理)
 
 
+// ============================================================
+//  自动更新 (v3.0.15)
+//  流程: 检查更新 -> 比较版本 -> 下载 zip -> 重启并就地覆盖 -> 启动新版本
+//  设计取舍:
+//    1. 不引第三方依赖(electron-updater 强依赖 electron-builder 的产物布局),
+//       本项目是"解压即用"的便携版, 用 zip + PowerShell 就地替换最稳。
+//    2. 替换时排除 userdata / downloads / node_modules, 账号登录态绝不丢。
+//    3. 更新包两类都能吃:
+//       a) 完整便携包(含 exe 或 resources/ 目录) -> 覆盖整个安装目录
+//       b) 纯代码包(只有 js/html/ico) -> 只覆盖代码文件
+//    4. 参数不拼命令行, 落成 _update/update.json 交给脚本读, 规避中文路径转义。
+// ============================================================
+const APP_VERSION = (() => {
+  try { return String(require(path.join(APP_DIR, 'package.json')).version || '0.0.0'); }
+  catch (e) { return '0.0.0'; }
+})();
+const UPDATE_DIR = path.join(USER_DIR, '_update');
+// 兜底更新源: 仓库的 Releases(latest)。未在设置里填自定义地址时用它。
+const GH_REPO = 'jianbingdev/doubao-multi-open';
+const GH_LATEST = 'https://api.github.com/repos/' + GH_REPO + '/releases/latest';
+
+const updateState = { latest: null, zipFile: null, downloading: false };
+
+// 就地替换脚本: 等主进程退出 -> 解压 -> robocopy 覆盖(跳过用户数据) -> 重启
+// 只在 applyUpdate 里被写到 _update/apply-update.ps1 再由 powershell 执行。
+// 注意: 全部用 ASCII, 避免任何编码问题; 参数从同目录 update.json 读取。
+const UPDATE_SCRIPT = [
+  '$ErrorActionPreference = "Stop"',
+  '$here = Split-Path -Parent $PSCommandPath',
+  // 第一件事写"脚本已启动"标记: 主程序靠它确认脚本真跑起来了, 否则不退出
+  'try { Set-Content -LiteralPath (Join-Path $here "booted.txt") -Value ("boot " + (Get-Date).ToString("HH:mm:ss") + " pid=" + $PID) -Encoding UTF8 -Force } catch {}',
+  // 兜底痕迹: 万一后面读配置就失败了, 也能看出脚本确实启动过
+  'try { Add-Content -LiteralPath (Join-Path $here "early.log") -Value ("[" + (Get-Date).ToString("HH:mm:ss") + "] ps alive") -Encoding UTF8 } catch {}',
+  '$cfg = Get-Content -LiteralPath (Join-Path $here "update.json") -Raw -Encoding UTF8 | ConvertFrom-Json',
+  '$logFile = $cfg.logFile',
+  'function Write-Log([string]$m) {',
+  '  try {',
+  '    $t = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")',
+  '    Add-Content -LiteralPath $logFile -Value ("[" + $t + "] " + $m) -Encoding UTF8',
+  '  } catch {}',
+  '}',
+  'function Fail([string]$m) {',
+  '  Write-Log ("FAILED: " + $m)',
+  '  try {',
+  '    Add-Type -AssemblyName System.Windows.Forms',
+  '    $msg = "Update failed." + [Environment]::NewLine + [Environment]::NewLine + $m + [Environment]::NewLine + [Environment]::NewLine + "Please unzip the latest release manually."',
+  '    [System.Windows.Forms.MessageBox]::Show($msg, "Doubao Multi-Open - Update", "OK", "Warning") | Out-Null',
+  '  } catch {}',
+  '  exit 1',
+  '}',
+  'Write-Log "=== update script started ==="',
+  'Write-Log ("target=" + $cfg.target)',
+  'Write-Log ("zip=" + $cfg.zip)',
+  'try {',
+  '  $p = Get-Process -Id $cfg.parentPid -ErrorAction SilentlyContinue',
+  '  $n = 0',
+  '  while ($p -and $n -lt 150) {',
+  '    Start-Sleep -Milliseconds 400',
+  '    $n++',
+  '    $p = Get-Process -Id $cfg.parentPid -ErrorAction SilentlyContinue',
+  '  }',
+  '  Write-Log "app exited"',
+  '} catch { Write-Log "wait app warning" }',
+  'Start-Sleep -Milliseconds 900',
+  'if (-not (Test-Path -LiteralPath $cfg.zip)) { Fail "zip not found" }',
+  '$tmp = Join-Path $env:TEMP ("dbmo_update_" + [guid]::NewGuid().ToString("N"))',
+  'try {',
+  '  New-Item -ItemType Directory -Path $tmp -Force | Out-Null',
+  '  Expand-Archive -LiteralPath $cfg.zip -DestinationPath $tmp -Force',
+  '} catch { Fail ("extract failed: " + $_.Exception.Message) }',
+  'Write-Log ("extracted to " + $tmp)',
+  '$root = $tmp',
+  '$top = @(Get-ChildItem -LiteralPath $tmp -Force)',
+  '$hasExe = @($top | Where-Object { -not $_.PSIsContainer -and $_.Extension -eq ".exe" })',
+  '$hasRes = @($top | Where-Object { $_.PSIsContainer -and $_.Name -eq "resources" })',
+  'if ($hasExe.Count -eq 0 -and $hasRes.Count -eq 0 -and $top.Count -eq 1 -and $top[0].PSIsContainer) {',
+  '  $root = $top[0].FullName',
+  '  Write-Log ("nested folder: " + $root)',
+  '}',
+  '$skipDirs = @("userdata", "downloads", "profiles", "node_modules", "_update")',
+  '$skipFiles = @("app-run.log", "update.log")',
+  'try {',
+  '  $copyArgs = @($root, $cfg.target, "/E", "/IS", "/IT", "/R:2", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")',
+  '  $copyArgs += "/XD"',
+  '  foreach ($d in $skipDirs) { $copyArgs += $d }',
+  '  $copyArgs += "/XF"',
+  '  foreach ($f in $skipFiles) { $copyArgs += $f }',
+  '  & robocopy @copyArgs | Out-Null',
+  '  $rc = $LASTEXITCODE',
+  '  Write-Log ("robocopy exit=" + $rc)',
+  '  if ($rc -ge 8) { Fail ("copy failed, robocopy exit " + $rc) }',
+  '} catch { Fail ("copy failed: " + $_.Exception.Message) }',
+  'try {',
+  '  if (-not (Test-Path -LiteralPath $cfg.exe)) { Fail ("exe missing after update: " + $cfg.exe) }',
+  '  if ([string]::IsNullOrWhiteSpace($cfg.launchArgs)) {',
+  '    Start-Process -FilePath $cfg.exe',
+  '  } else {',
+  '    Start-Process -FilePath $cfg.exe -ArgumentList $cfg.launchArgs',
+  '  }',
+  '  Write-Log "relaunched"',
+  '} catch { Fail ("relaunch failed: " + $_.Exception.Message) }',
+  'Start-Sleep -Seconds 2',
+  'try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}',
+  'try { Remove-Item -LiteralPath $cfg.zip -Force -ErrorAction SilentlyContinue } catch {}',
+  'Write-Log "=== done ==="'
+].join('\n');
+
+function parseVer(v) {
+  return String(v || '0').replace(/^v/i, '').trim().split(/[.\-+]/)
+    .map(n => parseInt(n, 10) || 0);
+}
+function cmpVer(a, b) {
+  const A = parseVer(a), B = parseVer(b);
+  for (let i = 0; i < 3; i++) {
+    const x = A[i] || 0, y = B[i] || 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+function humanSize(n) {
+  n = Number(n) || 0;
+  if (n > 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n > 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+// GET 一个 JSON, 走 Electron net(继承系统代理), 15 秒超时
+function netGetJSON(url) {
+  return new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = net.request({ method: 'GET', url, redirect: 'follow' });
+    } catch (e) { return reject(new Error('地址无效: ' + e.message)); }
+    req.setHeader('User-Agent', 'doubao-multi-open/' + APP_VERSION);
+    req.setHeader('Accept', 'application/vnd.github+json, application/json, text/plain, */*');
+    req.setHeader('Cache-Control', 'no-cache');
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { req.abort(); } catch (e) {}
+      reject(new Error('请求超时(15 秒)'));
+    }, 15000);
+    req.on('response', (res) => {
+      if (res.statusCode >= 400) {
+        clearTimeout(timer);
+        done = true;
+        res.on('data', () => {});
+        const hint = res.statusCode === 404 ? '(地址不存在或该仓库还没有发布版本)' : '';
+        return reject(new Error('HTTP ' + res.statusCode + hint));
+      }
+      let buf = '';
+      res.on('data', (c) => { buf += c.toString('utf-8'); });
+      res.on('end', () => {
+        clearTimeout(timer);
+        if (done) return;
+        done = true;
+        try { resolve(JSON.parse(buf)); }
+        catch (e) { reject(new Error('更新源返回的不是有效 JSON')); }
+      });
+    });
+    req.on('error', (e) => {
+      clearTimeout(timer);
+      if (done) return;
+      done = true;
+      reject(new Error(e.message || '网络请求失败'));
+    });
+    req.end();
+  });
+}
+
+// 兼容两种清单: GitHub Releases API  /  自建 version.json
+function normalizeManifest(d) {
+  if (!d || typeof d !== 'object') return null;
+  if (d.tag_name || Array.isArray(d.assets)) {
+    const assets = Array.isArray(d.assets) ? d.assets : [];
+    const pick = assets.find(a => /\.zip$/i.test(a.name || '')) || assets[0];
+    if (!pick || !pick.browser_download_url) return null;
+    return {
+      version: String(d.tag_name || d.name || '').replace(/^v/i, ''),
+      notes: String(d.body || ''),
+      url: pick.browser_download_url,
+      size: Number(pick.size) || 0,
+      sha256: '',
+      source: 'github'
+    };
+  }
+  const ver = d.version || d.latest || d.tag || d.tag_name;
+  const url = d.url || d.download || d.downloadUrl ||
+    (Array.isArray(d.assets) && d.assets[0] && (d.assets[0].url || d.assets[0].browser_download_url));
+  if (!ver || !url) return null;
+  const notes = Array.isArray(d.notes) ? d.notes.join('\n') : (d.notes || d.changelog || d.body || '');
+  return {
+    version: String(ver).replace(/^v/i, ''),
+    notes: String(notes || ''),
+    url: String(url),
+    size: Number(d.size) || 0,
+    sha256: String(d.sha256 || '').toLowerCase(),
+    source: 'custom'
+  };
+}
+
+function updateSourceUrl() {
+  const custom = String(prefs.updateUrl || '').trim();
+  return custom || GH_LATEST;
+}
+
+// 作废已下载的更新包(远端版本变了 / 已是最新 / 重新下载前)
+function clearCachedPackage() {
+  try { fs.rmSync(path.join(UPDATE_DIR, 'package.zip'), { force: true }); } catch (e) {}
+  try { fs.rmSync(path.join(UPDATE_DIR, 'manifest.json'), { force: true }); } catch (e) {}
+}
+
+async function checkForUpdate() {
+  const src = updateSourceUrl();
+  const cachedVer = (updateState.latest && updateState.zipFile) ? updateState.latest.version : null;
+  log('检查更新: ' + src);
+  let raw;
+  try {
+    raw = await netGetJSON(src);
+  } catch (e) {
+    return { ok: false, current: APP_VERSION, error: e.message, source: src };
+  }
+  const m = normalizeManifest(raw);
+  if (!m || !m.url) {
+    return { ok: false, current: APP_VERSION, error: '更新源内容无法识别(缺少 version / 下载地址)', source: src };
+  }
+  const hasNew = cmpVer(m.version, APP_VERSION) > 0;
+  updateState.latest = hasNew ? m : null;
+  if (!hasNew) {
+    updateState.zipFile = null;
+    clearCachedPackage();
+  } else if (cachedVer !== m.version) {
+    // 远端版本变了, 上次下的包作废
+    updateState.zipFile = null;
+    clearCachedPackage();
+  }
+  log('版本比较: 当前 ' + APP_VERSION + ' / 远程 ' + m.version + ' => ' + (hasNew ? '有新版本' : '已是最新'));
+  return {
+    ok: true,
+    current: APP_VERSION,
+    latest: m.version,
+    hasNew,
+    cached: !!(hasNew && updateState.zipFile),
+    notes: m.notes,
+    size: m.size,
+    sizeText: humanSize(m.size),
+    source: m.source,
+    url: m.url
+  };
+}
+
+// 下载到 userdata/_update/package.zip, 期间推送进度
+function downloadUpdate() {
+  const m = updateState.latest;
+  if (!m) return Promise.reject(new Error('没有可用的更新, 请先检查更新'));
+  if (updateState.downloading) return Promise.reject(new Error('正在下载中'));
+
+  fs.mkdirSync(UPDATE_DIR, { recursive: true });
+  const file = path.join(UPDATE_DIR, 'package.zip');
+  clearCachedPackage();
+
+  updateState.downloading = true;
+  log('开始下载更新: ' + m.url);
+
+  return new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = net.request({ method: 'GET', url: m.url, redirect: 'follow' });
+    } catch (e) {
+      updateState.downloading = false;
+      return reject(new Error('下载地址无效: ' + e.message));
+    }
+    req.setHeader('User-Agent', 'doubao-multi-open/' + APP_VERSION);
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      updateState.downloading = false;
+      try { req.abort(); } catch (e) {}
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    req.on('response', (res) => {
+      if (res.statusCode >= 400) {
+        res.on('data', () => {});
+        return fail(new Error('下载失败 HTTP ' + res.statusCode));
+      }
+      const total = parseInt(res.headers['content-length'], 10) || m.size || 0;
+      let got = 0, lastPush = 0;
+      const ws = fs.createWriteStream(file);
+
+      res.on('data', (chunk) => {
+        got += chunk.length;
+        const now = Date.now();
+        if (now - lastPush > 120) {
+          lastPush = now;
+          pushToRenderer('update:progress', {
+            phase: 'download', got, total,
+            percent: total ? Math.min(100, Math.round(got / total * 100)) : 0,
+            gotText: humanSize(got), totalText: humanSize(total)
+          });
+        }
+      });
+      res.on('error', (e) => fail(e));
+      res.pipe(ws);
+
+      ws.on('error', (e) => fail(new Error('写入文件失败: ' + e.message)));
+      ws.on('finish', () => {
+        if (settled) return;
+        if (total && got !== total) return fail(new Error('下载不完整(' + got + '/' + total + ' 字节), 请重试'));
+        // 可选完整性校验
+        if (m.sha256) {
+          try {
+            const h = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+            if (h !== m.sha256) return fail(new Error('文件校验失败(SHA256 不匹配), 已中止'));
+          } catch (e) { return fail(new Error('校验失败: ' + e.message)); }
+        }
+        settled = true;
+        updateState.downloading = false;
+        updateState.zipFile = file;
+        try {
+          fs.writeFileSync(path.join(UPDATE_DIR, 'manifest.json'),
+            JSON.stringify({ version: m.version, notes: m.notes, url: m.url, size: got }, null, 2), 'utf-8');
+        } catch (e) {}
+        log('更新包下载完成: ' + file + ' (' + humanSize(got) + ')');
+        pushToRenderer('update:progress', { phase: 'done', got, total, percent: 100, gotText: humanSize(got), totalText: humanSize(total) });
+        resolve({ file, size: got, sizeText: humanSize(got) });
+      });
+    });
+    req.on('error', (e) => fail(new Error(e.message || '下载中断')));
+    req.end();
+  });
+}
+
+// 启动更新脚本。
+// v3.0.17 修复: 原来直接 spawn('powershell.exe', ...) 在本机会静默失败——
+// 进程能拿到 pid、不报错, 但脚本一行都没执行(连日志都不写), 于是既没更新也没重启。
+// 实测改用 cmd 的 start 才能真正拉起独立进程。
+function launchUpdateScript(scriptPath) {
+  const child = spawn('cmd.exe',
+    ['/c', 'start', '/min', '', 'powershell.exe',
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+    { detached: true, stdio: 'ignore', windowsHide: true });
+  let launchErr = null;
+  child.on('error', (e) => { launchErr = e; });
+  child.unref();
+  return { pid: child.pid, getError: () => launchErr };
+}
+
+// 轮询等待某个文件出现
+function waitForFile(file, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (fs.existsSync(file)) return resolve(true);
+      if (Date.now() - t0 > timeoutMs) return resolve(false);
+      setTimeout(tick, 200);
+    };
+    tick();
+  });
+}
+
+// 生成更新脚本并脱离父进程启动, 确认脚本真的起来后才退出应用
+async function applyUpdate() {
+  const zip = updateState.zipFile;
+  if (!zip || !fs.existsSync(zip)) throw new Error('更新包不存在, 请重新下载');
+
+  const packaged = app.isPackaged;
+  const target = packaged ? path.dirname(app.getPath('exe')) : APP_DIR;
+  const exe = packaged ? app.getPath('exe') : process.execPath;
+  const launchArgs = packaged ? '' : APP_DIR;
+
+  fs.mkdirSync(UPDATE_DIR, { recursive: true });
+  const scriptPath = path.join(UPDATE_DIR, 'apply-update.ps1');
+  const cfgPath = path.join(UPDATE_DIR, 'update.json');
+  const bootFlag = path.join(UPDATE_DIR, 'booted.txt');
+
+  const cfg = {
+    parentPid: process.pid,
+    zip,
+    target,
+    exe,
+    launchArgs,
+    // 日志写到安装目录根, 而不是 _update 里 —— 后者下次启动会被清掉
+    logFile: path.join(DATA_DIR, 'update.log')
+  };
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf-8');
+  // BOM 必须写: Windows PowerShell 5.1 读无 BOM 的 UTF-8 .ps1 会按 ANSI 解码,
+  // 一旦脚本里出现非 ASCII 字符就会解析失败(本项目路径全是中文)。
+  fs.writeFileSync(scriptPath, '\uFEFF' + UPDATE_SCRIPT, 'utf-8');
+
+  try { fs.rmSync(bootFlag, { force: true }); } catch (e) {}
+  try { fs.rmSync(path.join(UPDATE_DIR, 'early.log'), { force: true }); } catch (e) {}
+
+  log('启动更新脚本: target=' + target + ' exe=' + exe);
+  const launcher = launchUpdateScript(scriptPath);
+  log('启动器 pid=' + launcher.pid + ', 等待脚本确认...');
+
+  const booted = await waitForFile(bootFlag, 10000);
+  if (!booted) {
+    const e = launcher.getError();
+    log('更新脚本未能启动' + (e ? ': ' + e.message : ' (10 秒内无响应)'));
+    return {
+      ok: false,
+      error: e
+        ? ('无法启动更新程序: ' + e.message)
+        : '更新程序 10 秒内没有响应(可能被安全软件或系统策略拦截了 PowerShell)。软件未退出, 可稍后重试。'
+    };
+  }
+
+  log('更新脚本已启动(booted), 准备退出主进程');
+  // 先让返回值传回界面, 再退出
+  setTimeout(() => {
+    forceQuitting.value = true;
+    app.quit();
+  }, 500);
+  return { ok: true, target, exe };
+}
+
+// 启动时清掉上次更新留下的脚本, 但保留已下载好的 zip
+// (用户可能下载完先没重启, 下次打开直接点"重启并更新"即可, 不用重下)
+function cleanupUpdateDir() {
+  try {
+    if (!fs.existsSync(UPDATE_DIR)) return;
+    for (const f of fs.readdirSync(UPDATE_DIR)) {
+      if (f === 'package.zip' || f === 'manifest.json') continue;
+      try { fs.rmSync(path.join(UPDATE_DIR, f), { recursive: true, force: true }); } catch (e) {}
+    }
+  } catch (e) { log('清理更新缓存失败: ' + e.message); }
+}
+
+// 恢复上次已下载的更新包, 让界面直接显示"可重启更新"
+function restoreUpdateState() {
+  try {
+    const mf = path.join(UPDATE_DIR, 'manifest.json');
+    const zip = path.join(UPDATE_DIR, 'package.zip');
+    if (!fs.existsSync(mf)) return;
+    if (!fs.existsSync(zip)) {
+      // 只剩清单没有包, 视为作废
+      try { fs.rmSync(mf, { force: true }); } catch (e) {}
+      return;
+    }
+    const d = JSON.parse(fs.readFileSync(mf, 'utf-8'));
+    if (!d || !d.version || cmpVer(d.version, APP_VERSION) <= 0) return;
+    updateState.latest = {
+      version: String(d.version),
+      notes: String(d.notes || ''),
+      url: String(d.url || ''),
+      size: fs.statSync(zip).size,
+      sha256: '',
+      source: 'cached'
+    };
+    updateState.zipFile = zip;
+    log('发现已下载的更新包: v' + d.version + ', 可直接重启更新');
+  } catch (e) { log('恢复更新缓存失败: ' + e.message); }
+}
+
+ipcMain.handle('app:info', () => ({
+  version: APP_VERSION,
+  packaged: app.isPackaged,
+  dataDir: USER_DIR,
+  updateUrl: prefs.updateUrl || ''
+}));
+ipcMain.handle('update:check', () => checkForUpdate());
+ipcMain.handle('update:download', () => downloadUpdate());
+ipcMain.handle('update:apply', () => applyUpdate());
+ipcMain.handle('update:setSource', (e, url) => {
+  prefs.updateUrl = String(url || '').trim();
+  savePrefs();
+  log('更新源改为: ' + (prefs.updateUrl || '(默认 GitHub Releases)'));
+  return { ok: true, updateUrl: prefs.updateUrl };
+});
+
+
 // ---------- 单实例 ----------
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -1484,6 +1966,8 @@ if (!gotLock) {
 // ---------- 启动流程 ----------
 app.whenReady().then(() => {
   log('app ready, userData=' + app.getPath('userData'));
+  cleanupUpdateDir();
+  restoreUpdateState();
   sweepPendingCleanups();
   buildAppMenu();
   buildTray();

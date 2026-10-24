@@ -272,4 +272,193 @@ function refreshSoon() {
   refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 300);
 }
 
+// ---- 检查更新(v3.0.15) ----
+const btnUpdate = document.getElementById('btnUpdate');
+const updMask = document.getElementById('updMask');
+const updClose = document.getElementById('updClose');
+const updCur = document.getElementById('updCur');
+const updNew = document.getElementById('updNew');
+const updNotes = document.getElementById('updNotes');
+const updBarWrap = document.getElementById('updBarWrap');
+const updBar = document.getElementById('updBar');
+const updMsgEl = document.getElementById('updMsg');
+const updAction = document.getElementById('updAction');
+const updSource = document.getElementById('updSource');
+const updSrcBox = document.getElementById('updSrcBox');
+const updSrcInput = document.getElementById('updSrcInput');
+const updSrcSave = document.getElementById('updSrcSave');
+
+let appVersion = '';
+let currentUpdateUrl = '';
+// idle | checking | none | ready | downloading | downloaded | applying
+let updPhase = 'idle';
+
+function updMsg(text, isErr) {
+  updMsgEl.textContent = text || '';
+  updMsgEl.className = 'upd-msg' + (isErr ? ' err' : '');
+}
+function updProgress(pct) {
+  updBarWrap.hidden = false;
+  updBar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+}
+function closeUpdateModal() {
+  if (updPhase === 'downloading' || updPhase === 'applying') return; // 这两个阶段不许关
+  updMask.hidden = true;
+}
+function openUpdateModal() {
+  updMask.hidden = false;
+  runCheck();
+}
+
+async function runCheck() {
+  updPhase = 'checking';
+  updCur.textContent = appVersion ? 'v' + appVersion : '—';
+  updNew.textContent = '检测中…';
+  updNotes.hidden = true;
+  updNotes.textContent = '';
+  updBarWrap.hidden = true;
+  updBar.style.width = '0';
+  updAction.disabled = true;
+  updAction.textContent = '检测中…';
+  updMsg('正在连接更新源…');
+
+  let r = null;
+  try {
+    r = await window.api.updateCheck();
+  } catch (e) {
+    r = { ok: false, error: (e && e.message) ? e.message : String(e) };
+  }
+
+  if (!r || !r.ok) {
+    updPhase = 'idle';
+    updNew.textContent = '检测失败';
+    updMsg((r && r.error ? r.error : '检查更新失败') + '　可在「更新源」里换个地址。', true);
+    updAction.disabled = false;
+    updAction.textContent = '重试';
+    return;
+  }
+
+  updNew.textContent = 'v' + r.latest;
+  if (!r.hasNew) {
+    updPhase = 'none';
+    updMsg('已经是最新版本。');
+    updAction.disabled = false;
+    updAction.textContent = '重新检查';
+    btnUpdate.classList.remove('has-new');
+    return;
+  }
+
+  btnUpdate.classList.add('has-new');
+  updNotes.hidden = !r.notes;
+  updNotes.textContent = r.notes || '';
+  updAction.disabled = false;
+  if (r.cached) {
+    updPhase = 'downloaded';
+    updMsg('更新包已下载完成（' + r.sizeText + '），点右侧按钮重启并更新。');
+    updAction.textContent = '重启并更新';
+  } else {
+    updPhase = 'ready';
+    updMsg('发现新版本，安装包 ' + r.sizeText + '，点右侧按钮开始下载。');
+    updAction.textContent = '立即更新';
+  }
+}
+
+async function startDownload() {
+  updPhase = 'downloading';
+  updAction.disabled = true;
+  updAction.textContent = '下载中…';
+  updMsg('正在下载更新包…');
+  updProgress(0);
+  try {
+    const r = await window.api.updateDownload();
+    updPhase = 'downloaded';
+    updProgress(100);
+    updMsg('下载完成（' + r.sizeText + '），点右侧按钮重启并更新。');
+    updAction.textContent = '重启并更新';
+    updAction.disabled = false;
+  } catch (e) {
+    updPhase = 'ready';
+    updBarWrap.hidden = true;
+    updMsg('下载失败：' + ((e && e.message) ? e.message : String(e)), true);
+    updAction.textContent = '重试下载';
+    updAction.disabled = false;
+  }
+}
+
+async function applyNow() {
+  updPhase = 'applying';
+  updAction.disabled = true;
+  updAction.textContent = '正在重启…';
+  updClose.disabled = true;
+  updMsg('软件即将关闭并自动完成更新，几秒后会重新打开，请不要手动启动。');
+  try {
+    const r = await window.api.updateApply();
+    // 主进程确认更新脚本真的起来了才会退出; 没起来会返回失败, 这里必须提示,
+    // 否则用户看到的就是"什么都没发生"(v3.0.16 之前的老问题)
+    if (r && r.ok === false) {
+      updPhase = 'downloaded';
+      updClose.disabled = false;
+      updMsg(r.error || '更新程序未能启动，软件已取消退出。', true);
+      updAction.textContent = '重试更新';
+      updAction.disabled = false;
+      return;
+    }
+  } catch (e) {
+    updPhase = 'downloaded';
+    updClose.disabled = false;
+    updMsg('更新启动失败：' + ((e && e.message) ? e.message : String(e)), true);
+    updAction.textContent = '重试更新';
+    updAction.disabled = false;
+  }
+}
+
+updAction.onclick = () => {
+  if (updPhase === 'ready') return startDownload();
+  if (updPhase === 'downloaded') return applyNow();
+  if (updPhase === 'idle' || updPhase === 'none') return runCheck();
+};
+btnUpdate.onclick = openUpdateModal;
+updClose.onclick = closeUpdateModal;
+updMask.onclick = (e) => { if (e.target === updMask) closeUpdateModal(); };
+
+updSource.onclick = () => {
+  updSrcBox.hidden = !updSrcBox.hidden;
+  if (!updSrcBox.hidden) {
+    updSrcInput.value = currentUpdateUrl;
+    updSrcInput.focus();
+  }
+};
+updSrcSave.onclick = async () => {
+  try {
+    const r = await window.api.updateSetSource(updSrcInput.value);
+    currentUpdateUrl = (r && r.updateUrl) || '';
+    updSrcBox.hidden = true;
+    toast('更新源已保存，正在重新检查…');
+    runCheck();
+  } catch (e) {
+    updMsg('保存更新源失败：' + ((e && e.message) ? e.message : String(e)), true);
+  }
+};
+
+window.api.onUpdateProgress((d) => {
+  if (!d || d.phase !== 'download') return;
+  updProgress(d.percent);
+  updMsg('正在下载 ' + d.percent + '%　' + d.gotText + ' / ' + (d.totalText || '未知大小'));
+});
+
+window.api.onMenuCheckUpdate(() => openUpdateModal());
+
+// 版本号与更新源
+(async () => {
+  try {
+    const info = await window.api.appInfo();
+    appVersion = (info && info.version) || '';
+    currentUpdateUrl = (info && info.updateUrl) || '';
+    if (appVersion) {
+      btnUpdate.textContent = 'v' + appVersion;
+      btnUpdate.title = '当前版本 v' + appVersion + '，点击检查更新';
+    }
+  } catch (e) {}
+})();
+
 refresh();
