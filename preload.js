@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('api', {
   updateDownload: () => ipcRenderer.invoke('update:download'),
   updateApply: () => ipcRenderer.invoke('update:apply'),
   updateSetSource: (url) => ipcRenderer.invoke('update:setSource', url),
+  // 弹窗开关: 让主进程临时隐藏账号视图, 否则原生 WebContentsView 会盖住界面弹窗
+  uiModal: (open) => ipcRenderer.invoke('ui:modal', open),
 
   // 主进程推送
   onAccountReady: (cb) => ipcRenderer.on('account:ready', (e, d) => cb(d)),

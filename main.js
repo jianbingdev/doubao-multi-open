@@ -109,6 +109,37 @@ function getContentBounds() {
   };
 }
 
+// v4.1: 弹窗(检查更新/关于等)是主窗口 DOM 层, 而账号页面是 WebContentsView 原生层。
+// 原生视图永远绘制在 DOM 之上, 且它从侧栏右侧铺满整个内容区 —— 只要登录了账号,
+// 居中的 380px 弹窗就整块被豆包页面盖住, 用户看到的就是"点了检查更新没反应"。
+// 所以弹窗打开期间把激活视图隐藏, 关闭时再显示回来。
+let uiModalOpen = false;
+
+function applyViewVisibility() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const v = getActiveView();
+  if (!v) return;
+  log('弹窗' + (uiModalOpen ? '打开: 隐藏账号视图' : '关闭: 恢复账号视图'));
+  try {
+    v.setVisible(!uiModalOpen);
+    // 焦点原来在账号视图里, 视图藏起来后键盘事件就没人接了(Esc/Enter 全失效),
+    // 所以弹窗期间把焦点交回主窗口
+    if (uiModalOpen && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+      mainWindow.webContents.focus();
+    }
+    return;
+  } catch (e) {}
+  // 兜底: 运行时不支持 View.setVisible 时, 用挂载/卸载代替
+  try {
+    if (uiModalOpen) {
+      mainWindow.contentView.removeChildView(v);
+    } else {
+      mainWindow.contentView.addChildView(v);
+      v.setBounds(getContentBounds());
+    }
+  } catch (e) { log('切换视图可见性失败: ' + e.message); }
+}
+
 // ---------- 会话级钩子(下载/权限), 每个分区只挂一次 ----------
 function ensureSessionHooks(accountId) {
   const key = 'persist:' + accountId;
@@ -384,6 +415,17 @@ function createViewForAccount(account) {
     }
   });
 
+  // v4.1: 焦点在账号页面里时, 应用菜单的加速键(Chromium 不转发给视图)按了没反应,
+  // 这里把几个和账号无关的全局快捷键自己转一遍, 行为与菜单保持一致
+  wc.on('before-input-event', (e, input) => {
+    if (input.type !== 'keyDown' || input.alt || input.meta) return;
+    const k = String(input.key || '').toLowerCase();
+    if (input.control && !input.shift && k === 'u') {
+      e.preventDefault();
+      pushToRenderer('menu:checkUpdate');
+    }
+  });
+
   // 崩溃自愈: 渲染进程崩溃后自动重建同分区视图
   wc.on('render-process-gone', (e, detail) => {
     log('渲染进程退出: ' + account.id + ' reason=' + detail.reason);
@@ -464,6 +506,8 @@ function setActiveAccount(id) {
   mainWindow.contentView.addChildView(view);
   view.setBounds(getContentBounds());
   activeAccountId = id;
+  // 弹窗正处于打开状态时切号(如 Ctrl+1), 新挂上来的视图同样会盖住弹窗
+  if (uiModalOpen) applyViewVisibility();
   prefs.lastActiveId = id;
   savePrefs();
   log('切换账号: ' + account.label + ' (池=' + viewPool.size + ')');
@@ -1311,6 +1355,7 @@ function buildAppMenu() {
       submenu: [
         {
           label: '检查更新',
+          accelerator: 'CmdOrCtrl+U',
           click: () => { ShowMain(); pushToRenderer('menu:checkUpdate'); }
         },
         { type: 'separator' },
@@ -1533,6 +1578,9 @@ const UPDATE_SCRIPT = [
   'Write-Log "=== update script started ==="',
   'Write-Log ("target=" + $cfg.target)',
   'Write-Log ("zip=" + $cfg.zip)',
+  '$mode = "full"',
+  'try { if ($cfg.mode) { $mode = [string]$cfg.mode } } catch {}',
+  'Write-Log ("mode=" + $mode)',
   'try {',
   '  $p = Get-Process -Id $cfg.parentPid -ErrorAction SilentlyContinue',
   '  $n = 0',
@@ -1561,6 +1609,20 @@ const UPDATE_SCRIPT = [
   '}',
   '$skipDirs = @("userdata", "downloads", "profiles", "node_modules", "_update")',
   '$skipFiles = @("app-run.log", "update.log")',
+  // 核心包: 目标目录是 resources\app, 不存在就先建出来
+  'if ($mode -eq "core") {',
+  '  try {',
+  '    if (-not (Test-Path -LiteralPath $cfg.target)) { New-Item -ItemType Directory -Path $cfg.target -Force | Out-Null }',
+  '  } catch { Fail ("create target failed: " + $_.Exception.Message) }',
+  // 核心包内部保留了 resources\app 层级(为了兼容只会整目录覆盖的老客户端),
+  // 这里要下钻到那一层再复制, 否则会变成 resources\app\resources\app
+  '  $deep = Join-Path $root "resources"',
+  '  $deep = Join-Path $deep "app"',
+  '  if ((Test-Path -LiteralPath $deep) -and (Test-Path -LiteralPath (Join-Path $deep "package.json"))) {',
+  '    $root = $deep',
+  '    Write-Log "core: nested resources/app detected"',
+  '  }',
+  '}',
   'try {',
   '  $copyArgs = @($root, $cfg.target, "/E", "/IS", "/IT", "/R:2", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")',
   '  $copyArgs += "/XD"',
@@ -1652,11 +1714,17 @@ function netGetJSON(url) {
 }
 
 // 兼容两种清单: GitHub Releases API  /  自建 version.json
+// v4.1: 一个 Release 里可能同时挂了两个 zip ——
+//   *-core.zip              只有 js/html/ico/package.json, 约 200~300 KB, 用来增量更新
+//   *-windows-portable.zip  带 Electron 运行时的完整包, 约 140 MB, 只给首次安装/救急用
+// 有核心包就优先下核心包, 这样日常升级只花几百 KB、几秒钟。
 function normalizeManifest(d) {
   if (!d || typeof d !== 'object') return null;
   if (d.tag_name || Array.isArray(d.assets)) {
     const assets = Array.isArray(d.assets) ? d.assets : [];
-    const pick = assets.find(a => /\.zip$/i.test(a.name || '')) || assets[0];
+    const zips = assets.filter(a => /\.zip$/i.test(a.name || '') && a.browser_download_url);
+    const coreZip = zips.find(a => /-core\.zip$/i.test(a.name));
+    const pick = coreZip || zips[0] || assets[0];
     if (!pick || !pick.browser_download_url) return null;
     return {
       version: String(d.tag_name || d.name || '').replace(/^v/i, ''),
@@ -1664,21 +1732,28 @@ function normalizeManifest(d) {
       url: pick.browser_download_url,
       size: Number(pick.size) || 0,
       sha256: '',
-      source: 'github'
+      source: 'github',
+      kind: coreZip ? 'core' : 'full'
     };
   }
   const ver = d.version || d.latest || d.tag || d.tag_name;
-  const url = d.url || d.download || d.downloadUrl ||
+  // 自建清单: core 可以是字符串地址, 也可以是 {url,size,sha256}
+  const coreRaw = d.core || d.coreUrl || d.delta;
+  const coreObj = (coreRaw && typeof coreRaw === 'object') ? coreRaw : null;
+  const coreUrl = coreObj ? (coreObj.url || coreObj.download) : (typeof coreRaw === 'string' ? coreRaw : '');
+  const fullUrl = d.url || d.download || d.downloadUrl ||
     (Array.isArray(d.assets) && d.assets[0] && (d.assets[0].url || d.assets[0].browser_download_url));
+  const url = coreUrl || fullUrl;
   if (!ver || !url) return null;
   const notes = Array.isArray(d.notes) ? d.notes.join('\n') : (d.notes || d.changelog || d.body || '');
   return {
     version: String(ver).replace(/^v/i, ''),
     notes: String(notes || ''),
     url: String(url),
-    size: Number(d.size) || 0,
-    sha256: String(d.sha256 || '').toLowerCase(),
-    source: 'custom'
+    size: Number(coreObj ? coreObj.size : d.size) || 0,
+    sha256: String((coreObj && coreObj.sha256) || d.sha256 || '').toLowerCase(),
+    source: 'custom',
+    kind: coreUrl ? 'core' : 'full'
   };
 }
 
@@ -1717,7 +1792,7 @@ async function checkForUpdate() {
     updateState.zipFile = null;
     clearCachedPackage();
   }
-  log('版本比较: 当前 ' + APP_VERSION + ' / 远程 ' + m.version + ' => ' + (hasNew ? '有新版本' : '已是最新'));
+  log('版本比较: 当前 ' + APP_VERSION + ' / 远程 ' + m.version + ' => ' + (hasNew ? '有新版本(' + (m.kind === 'core' ? '核心包' : '完整包') + ')' : '已是最新'));
   return {
     ok: true,
     current: APP_VERSION,
@@ -1728,6 +1803,7 @@ async function checkForUpdate() {
     size: m.size,
     sizeText: humanSize(m.size),
     source: m.source,
+    kind: m.kind || 'full',
     url: m.url
   };
 }
@@ -1849,9 +1925,21 @@ async function applyUpdate() {
   if (!zip || !fs.existsSync(zip)) throw new Error('更新包不存在, 请重新下载');
 
   const packaged = app.isPackaged;
-  const target = packaged ? path.dirname(app.getPath('exe')) : APP_DIR;
+  const kind = (updateState.latest && updateState.latest.kind) || 'full';
   const exe = packaged ? app.getPath('exe') : process.execPath;
   const launchArgs = packaged ? '' : APP_DIR;
+  const installDir = packaged ? path.dirname(exe) : APP_DIR;
+  const appResDir = packaged ? path.join(installDir, 'resources', 'app') : APP_DIR;
+
+  // 核心包: 只把程序文件覆盖进 resources\app, 不动 exe / dll / electron 运行时,
+  //         也不会碰到同目录的 userdata —— 下载几百 KB, 一两秒装完。
+  // 完整包: 维持原样, 覆盖整个安装目录(跳过用户数据)。
+  let mode = (kind === 'core') ? 'core' : 'full';
+  if (mode === 'core' && !fs.existsSync(appResDir)) {
+    log('找不到 ' + appResDir + ', 改用完整包模式');
+    mode = 'full';
+  }
+  const target = (mode === 'core') ? appResDir : installDir;
 
   fs.mkdirSync(UPDATE_DIR, { recursive: true });
   const scriptPath = path.join(UPDATE_DIR, 'apply-update.ps1');
@@ -1861,6 +1949,7 @@ async function applyUpdate() {
   const cfg = {
     parentPid: process.pid,
     zip,
+    mode,
     target,
     exe,
     launchArgs,
@@ -1875,7 +1964,7 @@ async function applyUpdate() {
   try { fs.rmSync(bootFlag, { force: true }); } catch (e) {}
   try { fs.rmSync(path.join(UPDATE_DIR, 'early.log'), { force: true }); } catch (e) {}
 
-  log('启动更新脚本: target=' + target + ' exe=' + exe);
+  log('启动更新脚本: mode=' + mode + ' target=' + target + ' exe=' + exe);
   const launcher = launchUpdateScript(scriptPath);
   log('启动器 pid=' + launcher.pid + ', 等待脚本确认...');
 
@@ -1952,6 +2041,12 @@ ipcMain.handle('update:setSource', (e, url) => {
   savePrefs();
   log('更新源改为: ' + (prefs.updateUrl || '(默认 GitHub Releases)'));
   return { ok: true, updateUrl: prefs.updateUrl };
+});
+// 界面弹窗开/关时调用: 弹窗期间隐藏账号视图, 否则原生视图会盖住 DOM 弹窗
+ipcMain.handle('ui:modal', (e, open) => {
+  uiModalOpen = !!open;
+  applyViewVisibility();
+  return { ok: true, open: uiModalOpen };
 });
 
 

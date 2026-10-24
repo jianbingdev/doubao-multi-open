@@ -345,12 +345,23 @@ function updProgress(pct) {
   updBarWrap.hidden = false;
   updBar.style.width = Math.max(0, Math.min(100, pct)) + '%';
 }
+// 账号视图是原生 WebContentsView, 会盖住 DOM 弹窗(登录后点检查更新"没反应"的元凶),
+// 所以弹窗开/关都要通知主进程: 弹窗期间隐藏视图, 关掉后恢复
+function setAccountViewVisible(visible) {
+  try {
+    if (window.api && window.api.uiModal) window.api.uiModal(!visible);
+  } catch (e) {}
+}
 function closeUpdateModal() {
   if (updPhase === 'downloading' || updPhase === 'applying') return; // 这两个阶段不许关
   updMask.hidden = true;
+  setAccountViewVisible(true);
 }
 function openUpdateModal() {
   updMask.hidden = false;
+  setAccountViewVisible(false);
+  // 焦点原来可能停在账号页面里(键盘事件到不了这里), 抢回来
+  try { updMask.focus({ preventScroll: true }); } catch (e) {}
   runCheck();
 }
 
@@ -396,14 +407,18 @@ async function runCheck() {
   updNotes.hidden = !r.notes;
   updNotes.textContent = formatNotes(r.notes);
   updAction.disabled = false;
+  const isCore = r.kind === 'core';
+  const packText = isCore ? '核心包' : '完整包';
   if (r.cached) {
     updPhase = 'downloaded';
-    updMsg('更新包已下载完成（' + r.sizeText + '），点右侧按钮重启并更新。');
+    updMsg('更新包已下载完成（' + packText + ' ' + r.sizeText + '），点右侧按钮重启并更新。');
     updAction.textContent = '重启并更新';
   } else {
     updPhase = 'ready';
-    updMsg('发现新版本，安装包 ' + r.sizeText + '，点右侧按钮开始下载。');
-    updAction.textContent = '立即更新';
+    updMsg(isCore
+      ? '发现新版本，只需下载核心包 ' + r.sizeText + '（只替换程序文件，不动运行时和账号数据）。'
+      : '发现新版本，安装包 ' + r.sizeText + '，点右侧按钮开始下载。');
+    updAction.textContent = isCore ? '立即更新（' + r.sizeText + '）' : '立即更新';
   }
 }
 
@@ -464,6 +479,14 @@ updAction.onclick = () => {
 btnUpdate.onclick = openUpdateModal;
 updClose.onclick = closeUpdateModal;
 updMask.onclick = (e) => { if (e.target === updMask) closeUpdateModal(); };
+// Esc 关闭 / Enter 走主按钮(立即更新·重启并更新)
+// 挂在 window 上而不是弹窗上: 打开弹窗时焦点常常还在账号页面那边,
+// 挂 mask 的话按键根本到不了这里。
+window.addEventListener('keydown', (e) => {
+  if (updMask.hidden) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeUpdateModal(); return; }
+  if (e.key === 'Enter' && !updAction.disabled) { e.preventDefault(); updAction.click(); }
+});
 
 updSource.onclick = () => {
   updSrcBox.hidden = !updSrcBox.hidden;
