@@ -500,7 +500,8 @@ updSrcSave.onclick = async () => {
     const r = await window.api.updateSetSource(updSrcInput.value);
     currentUpdateUrl = (r && r.updateUrl) || '';
     updSrcBox.hidden = true;
-    toast('更新源已保存，正在重新检查…');
+    const eff = (r && r.effectiveUrl) || '';
+    toast(eff ? ('更新源已保存 → ' + eff) : '更新源已保存，正在重新检查…');
     runCheck();
   } catch (e) {
     updMsg('保存更新源失败：' + ((e && e.message) ? e.message : String(e)), true);

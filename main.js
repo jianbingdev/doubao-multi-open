@@ -1734,7 +1734,7 @@ function netGetJSON(url) {
 //   *-core.zip              只有 js/html/ico/package.json, 约 200~300 KB, 用来增量更新
 //   *-windows-portable.zip  带 Electron 运行时的完整包, 约 140 MB, 只给首次安装/救急用
 // 有核心包就优先下核心包, 这样日常升级只花几百 KB、几秒钟。
-function normalizeManifest(d) {
+function normalizeManifest(d, baseUrl) {
   if (!d || typeof d !== 'object') return null;
   if (d.tag_name || Array.isArray(d.assets)) {
     const assets = Array.isArray(d.assets) ? d.assets : [];
@@ -1765,7 +1765,7 @@ function normalizeManifest(d) {
   return {
     version: String(ver).replace(/^v/i, ''),
     notes: String(notes || ''),
-    url: String(url),
+    url: absUrl(url, baseUrl),
     size: Number(coreObj ? coreObj.size : d.size) || 0,
     sha256: String((coreObj && coreObj.sha256) || d.sha256 || '').toLowerCase(),
     source: 'custom',
@@ -1773,9 +1773,39 @@ function normalizeManifest(d) {
   };
 }
 
-function updateSourceUrl() {
-  const custom = String(prefs.updateUrl || '').trim();
-  return custom || GH_LATEST;
+// 用户输入归一化: 只写域名(example.com)也补上 https://
+function normalizeSourceInput(v) {
+  let s = String(v || '').trim();
+  if (!s) return '';
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  return s;
+}
+
+// 只填站点/目录也能用: https://example.com  →  https://example.com/latest.json
+// 已经是具体文件(.json/.txt)或带 ?query 的地址, 原样使用
+function manifestUrlFrom(src) {
+  const s = String(src || '').trim();
+  if (!s) return '';
+  if (/\.(json|txt)$/i.test(s)) return s;
+  if (s.includes('?')) return s;
+  return s.replace(/\/+$/, '') + '/latest.json';
+}
+
+// 清单里的下载地址允许写相对文件名(推荐: doubao-multi-open-v4.1.2-core.zip), 按清单地址补成绝对地址
+function absUrl(u, base) {
+  const s = String(u || '').trim();
+  if (!s) return '';
+  if (/^(https?:)?\/\//i.test(s)) return s;
+  if (!base) return s;
+  try { return new URL(s, base).toString(); } catch (e) { return s; }
+}
+
+// 返回要尝试的清单地址(按优先级): 目录形式先试 /latest.json, 再退回用户原样地址
+function updateSourceUrls() {
+  const custom = normalizeSourceInput(prefs.updateUrl);
+  if (!custom) return [GH_LATEST];
+  const p = manifestUrlFrom(custom);
+  return (p && p !== custom) ? [p, custom.replace(/\/+$/, '')] : [custom];
 }
 
 // 作废已下载的更新包(远端版本变了 / 已是最新 / 重新下载前)
@@ -1785,16 +1815,24 @@ function clearCachedPackage() {
 }
 
 async function checkForUpdate() {
-  const src = updateSourceUrl();
+  const urls = updateSourceUrls();
   const cachedVer = (updateState.latest && updateState.zipFile) ? updateState.latest.version : null;
-  log('检查更新: ' + src);
-  let raw;
-  try {
-    raw = await netGetJSON(src);
-  } catch (e) {
-    return { ok: false, current: APP_VERSION, error: e.message, source: src };
+  log('检查更新: ' + urls[0] + (urls.length > 1 ? '(备用 ' + urls[1] + ')' : ''));
+  let raw = null, src = urls[0], lastErr = null;
+  for (const u of urls) {
+    try {
+      raw = await netGetJSON(u);
+      src = u;
+      break;
+    } catch (e) {
+      lastErr = e;
+      log('  清单获取失败 ' + u + ' → ' + e.message);
+    }
   }
-  const m = normalizeManifest(raw);
+  if (!raw) {
+    return { ok: false, current: APP_VERSION, error: (lastErr && lastErr.message) || '网络请求失败', source: src };
+  }
+  const m = normalizeManifest(raw, src);
   if (!m || !m.url) {
     return { ok: false, current: APP_VERSION, error: '更新源内容无法识别(缺少 version / 下载地址)', source: src };
   }
@@ -2053,10 +2091,12 @@ ipcMain.handle('update:check', () => checkForUpdate());
 ipcMain.handle('update:download', () => downloadUpdate());
 ipcMain.handle('update:apply', () => applyUpdate());
 ipcMain.handle('update:setSource', (e, url) => {
-  prefs.updateUrl = String(url || '').trim();
+  prefs.updateUrl = normalizeSourceInput(url);
   savePrefs();
-  log('更新源改为: ' + (prefs.updateUrl || '(默认 GitHub Releases)'));
-  return { ok: true, updateUrl: prefs.updateUrl };
+  const eff = updateSourceUrls()[0];
+  log('更新源改为: ' + (prefs.updateUrl || '(默认 GitHub Releases)') +
+      (eff && eff !== prefs.updateUrl ? ' → 实际请求 ' + eff : ''));
+  return { ok: true, updateUrl: prefs.updateUrl, effectiveUrl: eff };
 });
 // 界面弹窗开/关时调用: 弹窗期间隐藏账号视图, 否则原生视图会盖住 DOM 弹窗
 ipcMain.handle('ui:modal', (e, open) => {
