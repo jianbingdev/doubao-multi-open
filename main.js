@@ -1361,12 +1361,28 @@ function buildAppMenu() {
         { type: 'separator' },
         {
           label: '关于', click: () => {
-            dialog.showMessageBox(mainWindow, {
-              type: 'info',
-              title: '关于',
-              message: '豆包多开管理器 v' + APP_VERSION,
-              detail: '视图池架构 · 单窗口毫秒级切号\n数据目录: ' + USER_DIR + '\n\n原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。'
-            });
+            const repoUrl = 'https://github.com/' + GH_REPO;
+            dialog
+              .showMessageBox(mainWindow, {
+                type: 'info',
+                title: '关于',
+                message: '豆包多开管理器 v' + APP_VERSION,
+                detail:
+                  '视图池架构 · 单窗口毫秒级切号\n' +
+                  '数据目录: ' + USER_DIR + '\n\n' +
+                  '原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。\n\n' +
+                  '开源地址: ' + repoUrl,
+                buttons: ['打开项目主页', '关闭'],
+                defaultId: 1,
+                cancelId: 1,
+                noLink: true
+              })
+              .then((r) => {
+                if (r.response === 0) {
+                  try { shell.openExternal(repoUrl); } catch (e) {}
+                }
+              })
+              .catch(() => {});
           }
         }
       ]
