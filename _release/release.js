@@ -202,8 +202,25 @@ function buildPortable(ver) {
     }
     const exe = path.join(out, 'electron.exe');
     if (!fs.existsSync(exe)) die('运行时里没有 electron.exe');
-    fs.renameSync(exe, path.join(out, 'DoubaoMultiOpen.exe'));
+    const targetExe = path.join(out, 'DoubaoMultiOpen.exe');
+    fs.renameSync(exe, targetExe);
     say(2, '可执行文件已命名为 DoubaoMultiOpen.exe');
+
+    // 写 exe 图标。图标在 PE 资源段里, 光改名没用 —— 不写的话
+    // 资源管理器里显示的永远是 Electron 的原子图标(和 app.ico 无关)。
+    const iconPath = path.join(ROOT, 'app.ico');
+    const rceditExe = path.join(ROOT, 'node_modules', 'rcedit', 'bin', 'rcedit-x64.exe');
+    if (fs.existsSync(rceditExe) && fs.existsSync(iconPath)) {
+      const r2 = spawnSync(rceditExe, [targetExe, '--set-icon', iconPath], { stdio: 'pipe', encoding: 'utf8' });
+      if (r2.status === 0) {
+        say(2, 'exe 图标已写入 (rcedit)');
+      } else {
+        // 写不进去不算致命: 程序能跑, 只是图标还是 Electron 的
+        console.log('  注意: exe 图标设置失败(不影响运行): ' + String(r2.stderr || r2.status).trim().slice(0, 160));
+      }
+    } else {
+      console.log('  注意: 找不到 rcedit 或 app.ico, 跳过 exe 图标设置');
+    }
   }
 
   // resources\app
