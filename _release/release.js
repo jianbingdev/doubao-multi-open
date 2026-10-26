@@ -42,11 +42,13 @@ const VERSION = argv.find((a) => /^v?\d+(\.\d+){0,2}$/i.test(a));
 const DRY = flag('--dry-run');
 const SKIP_BUILD = flag('--skip-build');
 const SKIP_SOURCE = flag('--skip-source');
+const FULL_ONLY = flag('--full-only');
 const NOTES_ARG = opt('--notes');
 
 if (!VERSION) {
-  console.error('用法: node _release\\release.js <版本号>  [--dry-run]');
-  console.error('  例: node _release\\release.js 4.1');
+  console.error('用法: node _release\\release.js <版本号>  [--dry-run] [--skip-build] [--skip-source] [--full-only]');
+  console.error('  例: node _release\\release.js 4.2');
+  console.error('  --full-only  只发完整包, 不产出/上传核心包(客户端要下 143MB)');
   process.exit(1);
 }
 const VER = VERSION.replace(/^v/i, '');
@@ -422,6 +424,30 @@ function loadNotes(ver) {
 function fullNotes(ver, body) {
   const asset = `DoubaoMultiOpen-v${ver}-windows-portable.zip`;
   const core = `DoubaoMultiOpen-v${ver}-core.zip`;
+
+  // --full-only: 这次没传核心包, 上面那套"点检查更新只拉几百 KB"的说法就不成立了,
+  // 得换成如实说明, 否则用户等着 200 KB 的更新却等来 143 MB。
+  if (FULL_ONLY) {
+    return [
+      `> [!IMPORTANT]`,
+      `> **这一版只提供完整包**（没有增量核心包）`,
+      `> - 已经装了旧版的 → 打开软件点侧栏版本徽标 → 检查更新，会下载约 143 MB 的完整包，`,
+      `>   装完账号不用重新登录（更新会跳过 \`userdata\` / \`downloads\`）`,
+      `> - 第一次安装 → 直接下载 \`${asset}\`，解压到任意目录（**别放 Program Files**）双击即用`,
+      `> - 名字很像、只有 200 KB 左右的 \`${REPO}-${ver}.zip\` 是 GitHub **自动生成的源码包**，`,
+      `>   里面只有 js/html，**没有 exe，不能直接运行**`,
+      `>`,
+      `> 浏览器若提示「检测到病毒」，是未签名程序的信誉误报（新发布、零下载量），在下载列表点「保留」即可。`,
+      '',
+      `## 豆包多开管理器 v${ver}`,
+      '',
+      body,
+      '',
+      '---',
+      `完整包自带 Electron 运行时，解压即用，不需要装 Node.js。`
+    ].join('\n');
+  }
+
   return [
     `> [!IMPORTANT]`,
     `> **该下载哪个？**`,
@@ -449,7 +475,10 @@ function fullNotes(ver, body) {
 }
 
 // ---------- 推源码 ----------
-const SRC_FILES = ['main.js', 'preload.js', 'member-preload.js', 'index.html', 'renderer.js', 'package.json', 'package-lock.json', 'README.md'];
+// 推送到 main 的文件清单。注意 app.ico 是二进制, 走 blob API 时用 base64。
+// v4.2: 补 app.ico(之前漏了, 换图标后源码里还是旧的) 和发版脚本本身。
+const SRC_FILES = ['main.js', 'preload.js', 'member-preload.js', 'index.html', 'renderer.js', 'package.json', 'package-lock.json', 'README.md', 'app.ico', '_release/release.js'];
+// 本次的更新说明也要带上(文件名随版本号变, 在 pushSource 里动态补)
 
 async function pushSource(ver, notesBody) {
   const ref = await gh('GET', `/repos/${OWNER}/${REPO}/git/ref/heads/main`);
@@ -459,7 +488,10 @@ async function pushSource(ver, notesBody) {
   say(4, 'main 当前: ' + baseSha.slice(0, 7));
 
   const entries = [];
-  for (const f of SRC_FILES) {
+  const files = SRC_FILES.slice();
+  const notesRel = '_release/notes/v' + ver + '.md';
+  if (fs.existsSync(path.join(ROOT, notesRel))) files.push(notesRel);
+  for (const f of files) {
     const p = path.join(ROOT, f);
     if (!fs.existsSync(p)) die('缺少源文件: ' + f);
     const content = fs.readFileSync(p);
@@ -546,21 +578,26 @@ async function uploadAssets(release, zipPaths) {
 
   const cur = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
   say(0, '当前版本: ' + cur + ' → 目标版本: ' + VER);
-  if (cmpVer(VER, cur) <= 0) {
-    die(`目标版本 ${VER} 不大于当前 ${cur}。客户端只认「远端 > 本地」, 版本号必须递增。`);
+  // 允许相等: 手动把 package.json 改到目标版本后再发版是常见做法。
+  // 只拦"降版本", 因为客户端只认「远端 > 本地」。
+  if (cmpVer(VER, cur) < 0) {
+    die(`目标版本 ${VER} 小于当前 ${cur}。客户端只认「远端 > 本地」, 版本号不能倒退。`);
   }
 
   const notesBody = loadNotes(VER);
   bumpVersion(VER);
   const outDir = buildPortable(VER);
   const zipPath = zipPortable(outDir, VER);
-  const corePath = zipCore(VER);
+  // --full-only: 只发完整包, 不产出也不上传核心包。
+  // 代价是客户端「检查更新」要下 143 MB(而不是 300 KB)。
+  const corePath = FULL_ONLY ? null : zipCore(VER);
 
   if (DRY) {
     console.log('\n[DRY RUN] 本地构建与打包已完成, 未触碰 GitHub。');
     console.log('  便携版目录: ' + outDir);
     console.log('  完整包    : ' + zipPath);
-    console.log('  核心包    : ' + corePath);
+    if (corePath) console.log('  核心包    : ' + corePath);
+    else console.log('  核心包    : (--full-only 已跳过)');
     console.log('\n确认无误后去掉 --dry-run 再跑一次即可发布。\n');
     process.exit(0);
   }
@@ -579,7 +616,7 @@ async function uploadAssets(release, zipPaths) {
 
   const release = await createRelease(VER, fullNotes(VER, notesBody), commitSha);
   // 核心包先传, 完整包后传(旧客户端只认第一个 zip)
-  await uploadAssets(release, [corePath, zipPath]);
+  await uploadAssets(release, FULL_ONLY ? [zipPath] : [corePath, zipPath]);
 
   const latest = await gh('GET', `/repos/${OWNER}/${REPO}/releases/latest`);
   const l = latest.json || {};
@@ -588,7 +625,7 @@ async function uploadAssets(release, zipPaths) {
     console.log('\n注意: latest 仍是 ' + l.tag_name + ', 可能因为该 Release 被标成了草稿/预发布。');
   }
   const names = (l.assets || []).map((a) => a.name);
-  if (l.tag_name === TAG) {
+  if (l.tag_name === TAG && !FULL_ONLY) {
     if (!names.some((n) => /-core\.zip$/i.test(n))) console.log('\n!! 警告: latest 里没有核心包, 客户端会退化成下载完整包。');
     if (names.length && !/-core\.zip$/i.test(names[0])) {
       console.log('\n!! 警告: 第一个资产不是核心包(' + names[0] + '), 旧客户端会去下完整包。');

@@ -195,6 +195,30 @@
     }
     .upd-src input:focus { border-color: #1d63d8; }
     .upd-src .mbtn { flex: 0 0 56px; padding: 6px 0; }
+    /* v4.2: 设置弹窗 */
+    .set-label { font-size: 12px; color: #1d1d1f; font-weight: 500; margin-bottom: 7px; }
+    .set-path { display: flex; gap: 6px; align-items: stretch; }
+    .set-path input {
+      flex: 1; min-width: 0; padding: 7px 9px; font-size: 11px;
+      border: 1px solid #d8d8dd; border-radius: 8px; background: #fafafb;
+      color: #515154; font-family: inherit; outline: none;
+    }
+    .set-path .mbtn { flex: 0 0 62px; padding: 0; }
+    .set-hint { margin: 9px 0 2px; font-size: 11px; color: #86868b; line-height: 1.65; }
+    .set-hint code { background: #f0f0f4; padding: 1px 4px; border-radius: 4px; font-size: 11px; }
+    .set-check {
+      display: flex; align-items: flex-start; gap: 7px;
+      margin-top: 14px; padding-top: 13px; border-top: 1px solid #eeeef2;
+      font-size: 12px; color: #515154; line-height: 1.5; cursor: pointer;
+    }
+    .set-check input { margin: 2px 0 0; flex: 0 0 auto; }
+    .set-check b { color: #b3261e; font-weight: 600; }
+    .set-warn {
+      margin-bottom: 12px; padding: 9px 11px; border-radius: 8px;
+      background: #fdecea; border: 1px solid #f5c6c2;
+      color: #b3261e; font-size: 12px; line-height: 1.6;
+    }
+    .set-warn[hidden] { display: none; }
   </style>
 </head>
 <body>
@@ -204,7 +228,6 @@
         <h1>豆包多开管理器</h1>
         <button class="ver-btn" id="btnUpdate" title="检查更新">v—</button>
       </div>
-      <p>v3 · 视图池 · 毫秒级切号</p>
     </div>
     <button class="btn-add" id="btnAdd">＋ 添加账号（在右侧页面直接扫码）</button>
     <button class="btn-check" id="btnCheckAll" title="逐个检查所有账号的登录凭证，自动修正侧栏在线状态">⟳ 检测账号状态</button>
@@ -213,10 +236,9 @@
       <div class="author-row">
         <span>作者：杂粮煎饼</span>
       </div>
-      <label class="pref-row">
-        <input type="checkbox" id="chkTray"> 关闭按钮最小化到托盘
-        &nbsp;·&nbsp;<a href="#" id="lnkDl" style="color:#1d63d8;">下载目录</a>
-      </label>
+      <div class="pref-row">
+        <a href="#" id="lnkDl" style="color:#1d63d8;">打开下载目录</a>
+      </div>
     </div>
   </aside>
   <div class="main-area">
@@ -248,6 +270,33 @@
       <div class="upd-src" id="updSrcBox" hidden>
         <input id="updSrcInput" placeholder="留空 = GitHub Releases；只填域名即可，如 https://example.com（自动补 /latest.json）" spellcheck="false">
         <button class="mbtn" id="updSrcSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- v4.2: 设置弹窗(与更新弹窗同一套遮挡处理: 打开时隐藏豆包视图) -->
+  <div class="mask" id="setMask" hidden tabindex="-1">
+    <div class="modal">
+      <div class="modal-head">
+        <span>设置</span>
+        <button class="modal-x" id="setClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="set-warn" id="setWarn" hidden></div>
+        <div class="set-label">下载保存位置</div>
+        <div class="set-path">
+          <input id="setDlPath" readonly title="当前下载目录">
+          <button class="mbtn" id="setBrowse">浏览…</button>
+        </div>
+        <p class="set-hint" id="setDlHint">所有账号下载的文件都直接存进这个文件夹，不再新建子文件夹。<br>留空则使用系统「下载」文件夹。</p>
+        <label class="set-check">
+          <input type="checkbox" id="setCloseExit">
+          <span>点右上角关闭时<b>直接退出程序</b>（不勾选则最小化到托盘）</span>
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button class="mbtn" id="setReset">恢复默认</button>
+        <button class="mbtn primary" id="setSave">保存</button>
       </div>
     </div>
   </div>

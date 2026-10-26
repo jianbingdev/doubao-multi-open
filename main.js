@@ -33,6 +33,63 @@ const APP_DIR = __dirname;
 const DATA_DIR = app.isPackaged ? path.dirname(app.getPath('exe')) : APP_DIR;
 const USER_DIR = path.join(DATA_DIR, 'userdata');
 const DOWNLOAD_DIR = path.join(DATA_DIR, 'downloads');
+
+// v4.2: 下载目录可在设置里改。默认用系统的"下载"文件夹。
+// 本机目录可能不可写(被策略拦/被重定向到不存在的盘), 所以做三级回退:
+//   1. 用户自定义路径 → 2. 系统下载文件夹 → 3. 桌面 → 4. 都不行则返回空串
+// 返回空串时由调用方弹设置窗口让用户自己选, 不能静默失败。
+function isDirWritable(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    // 光存在不够, 真写一个文件才能确认有写权限
+    const probe = path.join(dir, '.write-probe-' + Date.now() + '.tmp');
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function systemDownloadsDir() {
+  try {
+    const d = app.getPath('downloads');
+    if (d) return d;
+  } catch (e) { log('取系统下载文件夹失败: ' + e.message); }
+  return '';
+}
+
+function getDownloadDir() {
+  const custom = String(prefs.downloadDir || '').trim();
+  if (custom) {
+    if (isDirWritable(custom)) return custom;
+    log('自定义下载目录不可用, 改用系统下载文件夹: ' + custom);
+  }
+  const dl = systemDownloadsDir();
+  if (dl && isDirWritable(dl)) return dl;
+  if (dl) log('系统下载文件夹不可写, 改用桌面: ' + dl);
+
+  try {
+    const desk = app.getPath('desktop');
+    if (desk && isDirWritable(desk)) return desk;
+    if (desk) log('桌面不可写: ' + desk);
+  } catch (e) { log('取桌面路径失败: ' + e.message); }
+
+  log('没有可用的下载目录, 需要用户手动设置');
+  return '';
+}
+
+// 在资源管理器里打开当前下载目录(托盘菜单/侧栏链接/下载完成提示共用)
+function openDownloadFolder() {
+  const dir = getDownloadDir();
+  if (!dir) {
+    pushToRenderer('download:noDir');
+    return;
+  }
+  try {
+    shell.openExternal('file:///' + dir.replace(/\\/g, '/'));
+  } catch (e) { log('打开下载目录失败: ' + e.message); }
+}
 const LOG_FILE = path.join(DATA_DIR, 'app-run.log');
 app.setPath('userData', USER_DIR);
 try { app.setPath('crashDumps', path.join(USER_DIR, 'crashes')); } catch (e) {}
@@ -51,7 +108,7 @@ const PREFS_FILE = path.join(USER_DIR, 'prefs.json');
 function loadPrefs() {
   try { return JSON.parse(fs.readFileSync(PREFS_FILE, 'utf-8')); } catch (e) { return {}; }
 }
-let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '' }, loadPrefs());
+let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '' }, loadPrefs());
 function savePrefs() {
   try {
     fs.mkdirSync(USER_DIR, { recursive: true });
@@ -167,11 +224,17 @@ function ensureSessionHooks(accountId) {
     });
   } catch (e) { log('webRequest 钩子失败: ' + e.message); }
 
-  // 下载: 自动存到 程序目录\downloads\账号ID\
+  // 下载: 统一存到设置里的下载目录(默认 程序目录\downloads), 不按账号分子目录
   ses.on('will-download', (event, item) => {
+    // 一个可用的目录都没有: 取消这次下载, 弹设置窗口让用户自己选
+    const dir = getDownloadDir();
+    if (!dir) {
+      try { event.preventDefault(); } catch (e) {}
+      log('没有可用下载目录, 已取消下载并提示用户设置');
+      pushToRenderer('download:noDir');
+      return;
+    }
     try {
-      const dir = path.join(DOWNLOAD_DIR, accountId);
-      fs.mkdirSync(dir, { recursive: true });
       const base = item.getFilename() || ('file-' + Date.now());
       let savePath = path.join(dir, base);
       let i = 1;
@@ -185,8 +248,9 @@ function ensureSessionHooks(accountId) {
     item.once('done', (e2, state) => {
       if (state === 'completed') {
         log('下载完成: ' + item.getSavePath());
+        // 页面右下角的 toast 已经够了(6 秒自动消失, 还带"打开目录"),
+        // 不再弹 Windows 托盘气泡 —— 那个会带叮咚声, 太吵。
         pushToRenderer('download:done', { file: path.basename(item.getSavePath()), dir: path.dirname(item.getSavePath()) });
-        if (tray) { tray.displayBalloon && tray.displayBalloon({ title: '下载完成', content: path.basename(item.getSavePath()) }); }
       } else if (state === 'interrupted') {
         log('下载中断: ' + item.getFilename());
       }
@@ -1181,19 +1245,8 @@ async function deleteAccountDeep(id) {
   } else {
     log('分区已清除: ' + id);
   }
-  // 4. 顺带清掉该账号的下载目录(若有)
-  const dlDir = path.join(DOWNLOAD_DIR, id);
-  try {
-    if (fs.existsSync(dlDir)) {
-      const left = fs.readdirSync(dlDir);
-      if (left.length === 0) {
-        fs.rmdirSync(dlDir);
-        log('已清理空下载目录: ' + id);
-      } else {
-        log('下载目录有文件, 保留待用户处理: ' + dlDir + ' (' + left.length + ' 项)');
-      }
-    }
-  } catch (e5) {}
+  // 4. 下载目录不再按账号分了(所有文件混在同一个文件夹里),
+  //    所以删账号时不能动它 —— 否则会把别的账号下载的文件一起删掉。
 }
 
 function sweepPendingCleanups() {
@@ -1266,10 +1319,8 @@ function createMainWindow() {
     saveBounds();
     if (prefs.closeToTray && !forceQuitting.value) {
       e.preventDefault();
+      // 静默进托盘: 不弹托盘气泡、不出提示音
       mainWindow.hide();
-      if (tray) {
-        try { tray.displayBalloon({ title: '豆包多开管理器', content: '已最小化到托盘, 双击图标可恢复。' }); } catch (e2) {}
-      }
     }
   });
   mainWindow.on('closed', () => { mainWindow = null; activeAccountId = null; });
@@ -1307,7 +1358,7 @@ function buildAppMenu() {
       label: '文件(&F)',
       submenu: [
         { label: '添加豆包账号', accelerator: 'CmdOrCtrl+N', click: () => pushToRenderer('menu:addAccount') },
-        { label: '打开下载目录', click: () => { try { fs.mkdirSync(DOWNLOAD_DIR, { recursive: true }); shell.openExternal('file:///' + DOWNLOAD_DIR.replace(/\\/g, '/')); } catch (e) {} } },
+        { label: '打开下载目录', click: () => openDownloadFolder() },
         { type: 'separator' },
         { label: '退出', accelerator: 'CmdOrCtrl+Shift+Q', click: () => { forceQuitting.value = true; app.quit(); } }
       ]
@@ -1351,6 +1402,11 @@ function buildAppMenu() {
       })()
     },
     {
+      label: '设置(&P)',
+      accelerator: 'CmdOrCtrl+,',
+      click: () => { ShowMain(); pushToRenderer('menu:settings'); }
+    },
+    {
       label: '帮助(&H)',
       submenu: [
         {
@@ -1368,7 +1424,6 @@ function buildAppMenu() {
                 title: '关于',
                 message: '豆包多开管理器 v' + APP_VERSION,
                 detail:
-                  '视图池架构 · 单窗口毫秒级切号\n' +
                   '数据目录: ' + USER_DIR + '\n\n' +
                   '原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。\n\n' +
                   '开源地址: ' + repoUrl,
@@ -1530,11 +1585,36 @@ ipcMain.handle('prefs:get', () => prefs);ipcMain.handle('prefs:set', (e, patch) 
   return prefs;
 });
 ipcMain.handle('downloads:openFolder', () => {
-  try {
-    fs.mkdirSync(path.join(DOWNLOAD_DIR, activeAccountId || '_通用'), { recursive: true });
-    shell.openExternal('file:///' + DOWNLOAD_DIR.replace(/\\/g, '/'));
-  } catch (e) {}
+  openDownloadFolder();
   return true;
+});
+
+// v4.2: 设置里的下载路径 —— 选目录 / 读当前值
+ipcMain.handle('downloads:choose', async () => {
+  try {
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择下载保存位置',
+      defaultPath: getDownloadDir(),
+      buttonLabel: '选择此文件夹',
+      properties: ['openDirectory', 'createDirectory']
+    });
+    if (r.canceled || !r.filePaths || !r.filePaths[0]) return { ok: false, canceled: true };
+    return { ok: true, path: r.filePaths[0] };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('downloads:getDir', () => {
+  const dir = getDownloadDir();
+  const dl = systemDownloadsDir();
+  return {
+    dir: dir || '',
+    ok: !!dir,
+    isDefault: !String(prefs.downloadDir || '').trim(),
+    // 设置窗口里"恢复默认"用的目标: 系统下载文件夹, 拿不到就退回程序目录
+    defaultDir: dl || DOWNLOAD_DIR
+  };
 });
 
 // v3.0.9: 按用户要求移除"支持作者/收款码"整套功能
@@ -1791,7 +1871,7 @@ function manifestUrlFrom(src) {
   return s.replace(/\/+$/, '') + '/latest.json';
 }
 
-// 清单里的下载地址允许写相对文件名(推荐: doubao-multi-open-v4.1.2-core.zip), 按清单地址补成绝对地址
+// 清单里的下载地址允许写相对文件名(推荐: doubao-multi-open-v4.2-core.zip), 按清单地址补成绝对地址
 function absUrl(u, base) {
   const s = String(u || '').trim();
   if (!s) return '';
@@ -2127,6 +2207,15 @@ app.whenReady().then(() => {
   startGenWatcher();
   setTimeout(bootWarmup, 800);
   setInterval(rebuildTrayMenu, 15000);
+
+  // 调试钩子: 设环境变量 DOUBAO_TEST_NODIR=1 启动时, 3 秒后模拟"三处都不可写",
+  // 用来验证设置窗口的红字提示和自动弹出。正常启动不会触发。
+  if (process.env.DOUBAO_TEST_NODIR === '1') {
+    setTimeout(() => {
+      log('[调试] 模拟 download:noDir');
+      pushToRenderer('download:noDir');
+    }, 3000);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();

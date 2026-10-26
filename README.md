@@ -1,6 +1,6 @@
 # 豆包多开管理器
 
-![version](https://img.shields.io/badge/version-4.0-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-4.2-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
 
 **一个窗口，管住所有豆包账号。**
 
@@ -70,7 +70,8 @@
 
 - **一键切号**：侧栏点击 / 托盘菜单 / `Ctrl+1~9`
 - **视频生成后台等待**：视频任务转入后台持续跟进，真正生成完成才提示，不会提前报「已完成」
-- **下载自动归类**：生成的视频图片存到 `downloads\<账号ID>\`，落地即弹提示
+- **下载自动归类**：生成的视频图片存到可自定义的下载目录（默认 `downloads\`），落地即弹提示
+- **下载位置可设置**：菜单「设置」（`Ctrl+,`）里指定保存目录，所有账号的下载直接存进去，不再建子文件夹
 - **托盘常驻**：关闭按钮默认最小化到托盘，托盘右键可切号
 - **稳定性**：渲染进程崩溃自动重建视图、页面加载失败自动重试、单实例锁、记住窗口位置、内置 GPU 沙箱兼容参数
 

@@ -13,6 +13,9 @@ contextBridge.exposeInMainWorld('api', {
   prefsGet: () => ipcRenderer.invoke('prefs:get'),
   prefsSet: (patch) => ipcRenderer.invoke('prefs:set', patch),
   openDownloads: () => ipcRenderer.invoke('downloads:openFolder'),
+  // 下载路径设置(v4.2)
+  chooseDownloadDir: () => ipcRenderer.invoke('downloads:choose'),
+  getDownloadDir: () => ipcRenderer.invoke('downloads:getDir'),
 
   // 自动更新(v3.0.15)
   appInfo: () => ipcRenderer.invoke('app:info'),
@@ -34,5 +37,7 @@ contextBridge.exposeInMainWorld('api', {
   onAccountBusy: (cb) => ipcRenderer.on('account:busy', (e, d) => cb(d)),
   onMenuAdd: (cb) => ipcRenderer.on('menu:addAccount', () => cb()),
   onUpdateProgress: (cb) => ipcRenderer.on('update:progress', (e, d) => cb(d)),
-  onMenuCheckUpdate: (cb) => ipcRenderer.on('menu:checkUpdate', () => cb())
+  onMenuCheckUpdate: (cb) => ipcRenderer.on('menu:checkUpdate', () => cb()),
+  onMenuSettings: (cb) => ipcRenderer.on('menu:settings', () => cb()),
+  onDownloadNoDir: (cb) => ipcRenderer.on('download:noDir', () => cb())
 });

@@ -3,7 +3,7 @@ const listEl = document.getElementById('accountList');
 const btnAdd = document.getElementById('btnAdd');
 const btnCheckAll = document.getElementById('btnCheckAll');
 const mainTip = document.getElementById('mainTip');
-const chkTray = document.getElementById('chkTray');
+const chkTray = document.getElementById('chkTray'); // v4.2 起已挪到设置弹窗(setCloseExit)
 const toastWrap = document.getElementById('toastWrap');
 
 let accounts = [];
@@ -237,13 +237,7 @@ window.api.onDownloadDone((d) => {
 window.api.onMenuAdd(() => btnAdd.onclick());
 
 // ---- 偏好 ----
-(async () => {
-  const prefs = await window.api.prefsGet();
-  chkTray.checked = prefs.closeToTray !== false;
-})();
-chkTray.onchange = async () => {
-  await window.api.prefsSet({ closeToTray: chkTray.checked });
-};
+// v4.2: "关闭按钮最小化到托盘"从侧栏挪进设置窗口(与"关闭即退出"是同一项, 一处控制)
 document.getElementById('lnkDl').onclick = (e) => {
   e.preventDefault();
   window.api.openDownloads();
@@ -289,8 +283,7 @@ const updSrcInput = document.getElementById('updSrcInput');
 const updSrcSave = document.getElementById('updSrcSave');
 
 let appVersion = '';
-let currentUpdateUrl = '';
-// idle | checking | none | ready | downloading | downloaded | applying
+let currentUpdateUrl = '';// idle | checking | none | ready | downloading | downloaded | applying
 let updPhase = 'idle';
 
 // 更新说明来自 Release 正文, 是 Markdown。这里做轻量清洗:
@@ -363,6 +356,83 @@ function openUpdateModal() {
   // 焦点原来可能停在账号页面里(键盘事件到不了这里), 抢回来
   try { updMask.focus({ preventScroll: true }); } catch (e) {}
   runCheck();
+}
+
+// ---- 设置弹窗(v4.2) ----
+const setMask = document.getElementById('setMask');
+const setClose = document.getElementById('setClose');
+const setDlPath = document.getElementById('setDlPath');
+const setBrowse = document.getElementById('setBrowse');
+const setReset = document.getElementById('setReset');
+const setSave = document.getElementById('setSave');
+const setCloseExit = document.getElementById('setCloseExit');
+const setWarn = document.getElementById('setWarn');
+
+// warnMsg 传了就在弹窗顶部显示红字(v4.2: 默认下载位置不可用时用)
+async function openSettingsModal(warnMsg) {
+  try {
+    const [dir, prefs] = await Promise.all([window.api.getDownloadDir(), window.api.prefsGet()]);
+    setDlPath.value = dir.dir || '';
+    setDlPath.title = '当前：' + (dir.dir || '（不可用，请手动选择）');
+    setDlPath.dataset.default = dir.defaultDir || '';
+    // closeToTray === false 才表示"关闭即退出"
+    setCloseExit.checked = prefs.closeToTray === false;
+  } catch (e) {}
+  setWarn.hidden = !warnMsg;
+  setWarn.textContent = warnMsg || '';
+  setMask.hidden = false;
+  setAccountViewVisible(false);
+  try { setMask.focus({ preventScroll: true }); } catch (e) {}
+}
+
+function closeSettingsModal() {
+  setMask.hidden = true;
+  setAccountViewVisible(true);
+}
+
+setClose.onclick = () => closeSettingsModal();
+setMask.onclick = (e) => { if (e.target === setMask) closeSettingsModal(); };
+
+setBrowse.onclick = async () => {
+  try {
+    const r = await window.api.chooseDownloadDir();
+    if (r && r.ok && r.path) {
+      setDlPath.value = r.path;
+      setDlPath.title = '当前：' + r.path;
+    }
+  } catch (e) {
+    toast('选择文件夹失败：' + (e && e.message ? e.message : e));
+  }
+};
+
+setReset.onclick = () => {
+  setDlPath.value = setDlPath.dataset.default || '';
+  setDlPath.title = '当前：' + setDlPath.value;
+};
+
+setSave.onclick = async () => {
+  const val = String(setDlPath.value || '').trim();
+  const def = setDlPath.dataset.default || '';
+  // 选的正好是默认目录时存空值, 这样以后系统下载文件夹变了也能跟着走
+  const toSave = (val === def) ? '' : val;
+  try {
+    await window.api.prefsSet({
+      downloadDir: toSave,
+      closeToTray: !setCloseExit.checked   // 勾了"直接退出" => closeToTray=false
+    });
+    closeSettingsModal();
+    toast(toSave ? ('下载位置已保存：' + toSave) : '已恢复默认下载位置（系统「下载」文件夹）');
+  } catch (e) {
+    toast('保存失败：' + (e && e.message ? e.message : e));
+  }
+};
+
+if (window.api.onMenuSettings) window.api.onMenuSettings(() => openSettingsModal());
+// 主进程找不到可用下载目录时会推这个, 直接把设置弹出来并红字提示
+if (window.api.onDownloadNoDir) {
+  window.api.onDownloadNoDir(() => {
+    openSettingsModal('默认下载位置不可用：系统「下载」文件夹和桌面都写不进去（可能被安全策略限制）。请手动选择一个可写入的文件夹，然后再重新下载。');
+  });
 }
 
 async function runCheck() {
@@ -483,6 +553,11 @@ updMask.onclick = (e) => { if (e.target === updMask) closeUpdateModal(); };
 // 挂在 window 上而不是弹窗上: 打开弹窗时焦点常常还在账号页面那边,
 // 挂 mask 的话按键根本到不了这里。
 window.addEventListener('keydown', (e) => {
+  // 设置弹窗优先处理(它和更新弹窗不会同时开)
+  if (!setMask.hidden) {
+    if (e.key === 'Escape') { e.preventDefault(); closeSettingsModal(); }
+    return;
+  }
   if (updMask.hidden) return;
   if (e.key === 'Escape') { e.preventDefault(); closeUpdateModal(); return; }
   if (e.key === 'Enter' && !updAction.disabled) { e.preventDefault(); updAction.click(); }
