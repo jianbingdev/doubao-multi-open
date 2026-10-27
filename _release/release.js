@@ -694,7 +694,7 @@ async function uploadAssets(release, zipPaths) {
 
   console.log('\n===== 完成 =====');
   console.log('Release 页面 : https://github.com/' + OWNER + '/' + REPO + '/releases/tag/' + TAG);
-  console.log('本地压缩包   : ' + zipPath);
+  console.log('本地压缩包   : ' + (zipPath || corePath || '(无)'));
   console.log('\n下一步: 打开旧版软件 → 点侧栏版本徽标 → 检查更新, 应能看到 v' + VER + '。');
   process.exit(0);
 })().catch((e) => die(e.message));
