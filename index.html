@@ -126,10 +126,11 @@
       align-items: center; justify-content: center;
       color: #86868b; font-size: 13px; pointer-events: none;
     }
-    .toast-wrap { position: fixed; right: 16px; bottom: 16px; z-index: 99; display: flex; flex-direction: column; gap: 8px; }
+    .toast-wrap { position: fixed; left: 12px; right: auto; bottom: 12px; width: 236px; z-index: 99; display: flex; flex-direction: column; gap: 8px; }
     .toast {
       background: rgba(28,28,32,.92); color: #fff; font-size: 12px;
-      padding: 10px 14px; border-radius: 10px; max-width: 320px;
+      padding: 10px 14px; border-radius: 10px; max-width: 100%;
+      overflow-wrap: anywhere;
       box-shadow: 0 4px 16px rgba(0,0,0,.25); cursor: default;
       animation: fadein .2s ease;
     }
@@ -226,7 +227,7 @@
     <div class="sidebar-header">
       <div class="brand-row">
         <h1>豆包多开管理器</h1>
-        <button class="ver-btn" id="btnUpdate" title="检查更新">v—</button>
+        <button class="ver-btn" id="btnUpdate" title="检查更新">测试版v—</button>
       </div>
     </div>
     <button class="btn-add" id="btnAdd">＋ 添加账号（在右侧页面直接扫码）</button>

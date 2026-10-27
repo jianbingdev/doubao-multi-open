@@ -1637,6 +1637,7 @@ const APP_VERSION = (() => {
   try { return String(require(path.join(APP_DIR, 'package.json')).version || '0.0.0'); }
   catch (e) { return '0.0.0'; }
 })();
+const APP_VERSION_LABEL = 'v' + APP_VERSION;
 const UPDATE_DIR = path.join(USER_DIR, '_update');
 // 兜底更新源: 仓库的 Releases(latest)。未在设置里填自定义地址时用它。
 const GH_REPO = 'jianbingdev/doubao-multi-open';
@@ -1895,6 +1896,11 @@ function clearCachedPackage() {
 }
 
 async function checkForUpdate() {
+  // 更新包正在下载时不要重复检查: 下面的"作废旧包"会把正在写入的 package.zip 删掉
+  if (updateState.downloading) {
+    log('检查更新: 跳过(更新包正在下载)');
+    return { ok: true, current: APP_VERSION, downloading: true };
+  }
   const urls = updateSourceUrls();
   const cachedVer = (updateState.latest && updateState.zipFile) ? updateState.latest.version : null;
   log('检查更新: ' + urls[0] + (urls.length > 1 ? '(备用 ' + urls[1] + ')' : ''));
@@ -1965,11 +1971,14 @@ function downloadUpdate() {
     }
     req.setHeader('User-Agent', 'doubao-multi-open/' + APP_VERSION);
     let settled = false;
+    let ws = null;   // 写入流提到外层: 失败时要能关掉, 否则 Windows 上句柄不释放,
+                     // 紧接着的 clearCachedPackage() 会删不掉半截的 package.zip
     const fail = (err) => {
       if (settled) return;
       settled = true;
       updateState.downloading = false;
       try { req.abort(); } catch (e) {}
+      if (ws) { try { ws.destroy(); } catch (e) {} }
       reject(err instanceof Error ? err : new Error(String(err)));
     };
 
@@ -1980,7 +1989,7 @@ function downloadUpdate() {
       }
       const total = parseInt(res.headers['content-length'], 10) || m.size || 0;
       let got = 0, lastPush = 0;
-      const ws = fs.createWriteStream(file);
+      ws = fs.createWriteStream(file);   // 赋给外层的 ws, 供 fail() 关闭
 
       res.on('data', (chunk) => {
         got += chunk.length;
@@ -2163,6 +2172,7 @@ function restoreUpdateState() {
 
 ipcMain.handle('app:info', () => ({
   version: APP_VERSION,
+  versionLabel: APP_VERSION_LABEL,
   packaged: app.isPackaged,
   dataDir: USER_DIR,
   updateUrl: prefs.updateUrl || ''

@@ -283,6 +283,7 @@ const updSrcInput = document.getElementById('updSrcInput');
 const updSrcSave = document.getElementById('updSrcSave');
 
 let appVersion = '';
+let appVersionLabel = '';
 let currentUpdateUrl = '';// idle | checking | none | ready | downloading | downloaded | applying
 let updPhase = 'idle';
 
@@ -345,8 +346,19 @@ function setAccountViewVisible(visible) {
     if (window.api && window.api.uiModal) window.api.uiModal(!visible);
   } catch (e) {}
 }
+// 版本徽标兼作后台下载进度条: 更新弹窗关掉后, 进度只能显示在这里
+function setBadge(text, tip, isNew) {
+  btnUpdate.textContent = text;
+  if (tip) btnUpdate.title = tip;
+  btnUpdate.classList.toggle('has-new', !!isNew);
+}
+function badgeVersion(tip, isNew) {
+  const label = appVersionLabel || (appVersion ? 'v' + appVersion : 'v—');
+  setBadge(label, tip || ('当前版本 ' + label + '，点击检查更新'), !!isNew);
+}
 function closeUpdateModal() {
-  if (updPhase === 'downloading' || updPhase === 'applying') return; // 这两个阶段不许关
+  if (updPhase === 'applying') return; // 已经在重启更新, 不许关
+  // downloading 阶段允许关: 下载跑在主进程, 关掉弹窗照样下, 进度转到版本徽标上
   updMask.hidden = true;
   setAccountViewVisible(true);
 }
@@ -355,6 +367,8 @@ function openUpdateModal() {
   setAccountViewVisible(false);
   // 焦点原来可能停在账号页面里(键盘事件到不了这里), 抢回来
   try { updMask.focus({ preventScroll: true }); } catch (e) {}
+  // 下载/安装进行中不要重新检查: 主进程会把正在写入的更新包当旧包作废
+  if (updPhase === 'downloading' || updPhase === 'applying') return;
   runCheck();
 }
 
@@ -391,7 +405,6 @@ function closeSettingsModal() {
 }
 
 setClose.onclick = () => closeSettingsModal();
-setMask.onclick = (e) => { if (e.target === setMask) closeSettingsModal(); };
 
 setBrowse.onclick = async () => {
   try {
@@ -436,8 +449,10 @@ if (window.api.onDownloadNoDir) {
 }
 
 async function runCheck() {
+  // 下载/安装进行中不要重新检查: 主进程会把正在写入的更新包当旧包作废
+  if (updPhase === 'downloading' || updPhase === 'applying') return;
   updPhase = 'checking';
-  updCur.textContent = appVersion ? 'v' + appVersion : '—';
+  updCur.textContent = appVersionLabel || '—';
   updNew.textContent = '检测中…';
   updNotes.hidden = true;
   updNotes.textContent = '';
@@ -463,17 +478,29 @@ async function runCheck() {
     return;
   }
 
+  // 主进程正在下载时只回 { downloading: true }，不带 latest/hasNew。
+  // 不先挡掉会走到下面 !r.hasNew 分支，误报"已经是最新版本"，还会把徽标
+  // 从「下载中 NN%」重置回版本号。触发场景：renderer 重载后 updPhase 归位成 idle。
+  if (r.downloading) {
+    updPhase = 'downloading';
+    updNew.textContent = '下载中';
+    updMsg('更新包正在后台下载，进度显示在左侧版本号上。');
+    updAction.disabled = true;
+    updAction.textContent = '下载中…';
+    return;
+  }
+
   updNew.textContent = 'v' + r.latest;
   if (!r.hasNew) {
     updPhase = 'none';
     updMsg('已经是最新版本。');
     updAction.disabled = false;
     updAction.textContent = '重新检查';
-    btnUpdate.classList.remove('has-new');
+    badgeVersion();
     return;
   }
 
-  btnUpdate.classList.add('has-new');
+  badgeVersion(null, true);
   updNotes.hidden = !r.notes;
   updNotes.textContent = formatNotes(r.notes);
   updAction.disabled = false;
@@ -498,6 +525,7 @@ async function startDownload() {
   updAction.textContent = '下载中…';
   updMsg('正在下载更新包…');
   updProgress(0);
+  updBadgeProgress(0);
   try {
     const r = await window.api.updateDownload();
     updPhase = 'downloaded';
@@ -505,13 +533,25 @@ async function startDownload() {
     updMsg('下载完成（' + r.sizeText + '），点右侧按钮重启并更新。');
     updAction.textContent = '重启并更新';
     updAction.disabled = false;
+    setBadge('可更新', '更新包已下载完成，点击重启并更新', true);
+    // 弹窗已经关掉(后台下载)才需要提醒, 开着的话界面上就写着
+    if (updMask.hidden) toast('更新包下载完成，点左侧版本号即可重启并更新');
   } catch (e) {
     updPhase = 'ready';
     updBarWrap.hidden = true;
-    updMsg('下载失败：' + ((e && e.message) ? e.message : String(e)), true);
+    const msg = (e && e.message) ? e.message : String(e);
+    updMsg('下载失败：' + msg, true);
     updAction.textContent = '重试下载';
     updAction.disabled = false;
+    badgeVersion('更新包下载失败：' + msg + '（点击重试）', true);
+    if (updMask.hidden) toast('更新包下载失败：' + msg);
   }
+}
+
+// 后台下载时把进度写到版本徽标上(弹窗开着就无所谓, 弹窗里有进度条)
+function updBadgeProgress(pct) {
+  if (!updMask.hidden) return;
+  setBadge('下载中 ' + pct + '%', '正在后台下载更新包 ' + pct + '%，点击查看详情', true);
 }
 
 async function applyNow() {
@@ -548,18 +588,11 @@ updAction.onclick = () => {
 };
 btnUpdate.onclick = openUpdateModal;
 updClose.onclick = closeUpdateModal;
-updMask.onclick = (e) => { if (e.target === updMask) closeUpdateModal(); };
-// Esc 关闭 / Enter 走主按钮(立即更新·重启并更新)
-// 挂在 window 上而不是弹窗上: 打开弹窗时焦点常常还在账号页面那边,
-// 挂 mask 的话按键根本到不了这里。
+// 两个弹窗都只认右上角的 ×: 点弹窗外面、按 Esc 都不再关窗。
+// 原来点外面一下就关, 更新弹窗里正在下载的进度说没就没, 误触代价太大。
+// Enter 仍然走更新弹窗的主按钮(立即更新·重启并更新)。
 window.addEventListener('keydown', (e) => {
-  // 设置弹窗优先处理(它和更新弹窗不会同时开)
-  if (!setMask.hidden) {
-    if (e.key === 'Escape') { e.preventDefault(); closeSettingsModal(); }
-    return;
-  }
-  if (updMask.hidden) return;
-  if (e.key === 'Escape') { e.preventDefault(); closeUpdateModal(); return; }
+  if (updMask.hidden || !setMask.hidden) return;
   if (e.key === 'Enter' && !updAction.disabled) { e.preventDefault(); updAction.click(); }
 });
 
@@ -587,6 +620,7 @@ window.api.onUpdateProgress((d) => {
   if (!d || d.phase !== 'download') return;
   updProgress(d.percent);
   updMsg('正在下载 ' + d.percent + '%　' + d.gotText + ' / ' + (d.totalText || '未知大小'));
+  updBadgeProgress(d.percent);
 });
 
 window.api.onMenuCheckUpdate(() => openUpdateModal());
@@ -596,11 +630,9 @@ window.api.onMenuCheckUpdate(() => openUpdateModal());
   try {
     const info = await window.api.appInfo();
     appVersion = (info && info.version) || '';
+    appVersionLabel = (info && info.versionLabel) || (appVersion ? 'v' + appVersion : '');
     currentUpdateUrl = (info && info.updateUrl) || '';
-    if (appVersion) {
-      btnUpdate.textContent = 'v' + appVersion;
-      btnUpdate.title = '当前版本 v' + appVersion + '，点击检查更新';
-    }
+    if (appVersionLabel) badgeVersion();
   } catch (e) {}
 })();
 

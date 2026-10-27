@@ -43,12 +43,23 @@ const DRY = flag('--dry-run');
 const SKIP_BUILD = flag('--skip-build');
 const SKIP_SOURCE = flag('--skip-source');
 const FULL_ONLY = flag('--full-only');
+const CORE_ONLY = flag('--core-only');
+const FULL_FROM = opt('--full-from');
 const NOTES_ARG = opt('--notes');
 
+if (FULL_ONLY && CORE_ONLY) {
+  console.error('--full-only 和 --core-only 不能同时用。');
+  process.exit(1);
+}
+
 if (!VERSION) {
-  console.error('用法: node _release\\release.js <版本号>  [--dry-run] [--skip-build] [--skip-source] [--full-only]');
+  console.error('用法: node _release\\release.js <版本号>  [选项]');
   console.error('  例: node _release\\release.js 4.2');
-  console.error('  --full-only  只发完整包, 不产出/上传核心包(客户端要下 143MB)');
+  console.error('  --dry-run        只本地构建, 不碰 GitHub');
+  console.error('  --full-only      只发完整包, 不产出/上传核心包(客户端要下 143MB)');
+  console.error('  --core-only      只发核心包(增量), 不产出/上传完整包');
+  console.error('                   完整包提示默认指向 Releases 列表; 想指到某个版本加');
+  console.error('                   --full-from 4.2  → 提示里直接给 v4.2 的下载页');
   process.exit(1);
 }
 const VER = VERSION.replace(/^v/i, '');
@@ -465,6 +476,35 @@ function fullNotes(ver, body) {
     ].join('\n');
   }
 
+  // --core-only: 小版本只发增量, 完整包留在之前的大版本里(省得每版都传 144 MB)。
+  // 说明必须明确指路, 否则第一次装的人只看到一个几百 KB 的包, 会以为下载坏了。
+  if (CORE_ONLY) {
+    const fullHint = FULL_FROM
+      ? `> - **第一次安装 / 想重新装一份干净的** → 这一版没带完整包，请先下载 ` +
+        `[v${FULL_FROM} 完整版](https://github.com/${OWNER}/${REPO}/releases/tag/v${FULL_FROM})，` +
+        `装好后点「检查更新」就升上来了`
+      : `> - **第一次安装 / 想重新装一份干净的** → 这一版没带完整包，` +
+        `请到 Releases 列表里找带 \`-windows-portable.zip\` 的版本下载，装好后点「检查更新」就升上来了`;
+    return [
+      `> [!IMPORTANT]`,
+      `> **这一版只有核心包**（增量更新，几百 KB）`,
+      `> - 已经装了旧版的 → 打开软件点侧栏版本徽标 → 检查更新，只会拉 \`${core}\`，`,
+      `>   几秒钟装完，只替换程序文件，账号不用重新登录`,
+      fullHint,
+      `> - 名字很像、只有 200 KB 左右的 \`${REPO}-${ver}.zip\` 是 GitHub **自动生成的源码包**，`,
+      `>   里面只有 js/html，**没有 exe，不能直接运行**`,
+      `>`,
+      `> 浏览器若提示「检测到病毒」，是未签名程序的信誉误报（新发布、零下载量），在下载列表点「保留」即可。`,
+      '',
+      `## 豆包多开管理器 v${ver}`,
+      '',
+      body,
+      '',
+      '---',
+      `更新只覆盖程序文件，跳过 \`userdata\` / \`downloads\` / \`profiles\`，登录态不会丢。`
+    ].join('\n');
+  }
+
   return [
     `> [!IMPORTANT]`,
     `> **该下载哪个？**`,
@@ -603,16 +643,18 @@ async function uploadAssets(release, zipPaths) {
 
   const notesBody = loadNotes(VER);
   bumpVersion(VER);
-  const outDir = buildPortable(VER);
-  const zipPath = zipPortable(outDir, VER);
+  // --core-only: 不产出完整包, 省掉 144 MB 的运行时复制/压缩/上传
+  const outDir = CORE_ONLY ? null : buildPortable(VER);
+  const zipPath = CORE_ONLY ? null : zipPortable(outDir, VER);
   // --full-only: 只发完整包, 不产出也不上传核心包。
   // 代价是客户端「检查更新」要下 143 MB(而不是 300 KB)。
   const corePath = FULL_ONLY ? null : zipCore(VER);
 
   if (DRY) {
     console.log('\n[DRY RUN] 本地构建与打包已完成, 未触碰 GitHub。');
-    console.log('  便携版目录: ' + outDir);
-    console.log('  完整包    : ' + zipPath);
+    if (outDir) console.log('  便携版目录: ' + outDir);
+    if (zipPath) console.log('  完整包    : ' + zipPath);
+    else console.log('  完整包    : (--core-only 已跳过)');
     if (corePath) console.log('  核心包    : ' + corePath);
     else console.log('  核心包    : (--full-only 已跳过)');
     console.log('\n确认无误后去掉 --dry-run 再跑一次即可发布。\n');
@@ -633,7 +675,8 @@ async function uploadAssets(release, zipPaths) {
 
   const release = await createRelease(VER, fullNotes(VER, notesBody), commitSha);
   // 核心包先传, 完整包后传(旧客户端只认第一个 zip)
-  await uploadAssets(release, FULL_ONLY ? [zipPath] : [corePath, zipPath]);
+  const assets = FULL_ONLY ? [zipPath] : CORE_ONLY ? [corePath] : [corePath, zipPath];
+  await uploadAssets(release, assets);
 
   const latest = await gh('GET', `/repos/${OWNER}/${REPO}/releases/latest`);
   const l = latest.json || {};
