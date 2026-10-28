@@ -24,6 +24,11 @@
 
   const MIN_PX = 30;                 // 豆包头像/图标 20px，30 能排掉
   const CDN_RE = /^https:\/\/p\d+-flow-imagex-sign\.byteimg\.com\//;
+  // 除了豆包 CDN，用户自己粘贴进来的图是 blob: / data: URL，也必须能选。
+  // 豆包发送后先用 blob 做本地预览，重新加载页面才换成 CDN 地址，
+  // 所以两种都得认，否则「粘贴发出去的那张」永远没复选框。
+  const isSelectable = (u) =>
+    CDN_RE.test(u) || /^blob:/.test(u) || /^data:image\//.test(u);
   const GAP = 8;                     // 复选框离图片边缘的距离
 
   // ---------- 小工具 ----------
@@ -248,9 +253,19 @@
   }
 
   function decorate(img) {
-    if (img.__dbPick || S.boxes.has(img)) return;
+    // 不再用 img.__dbPick 做标记：豆包会复用同一个 <img> 元素（src 从 CDN 换成 blob），
+    // 标记留在元素上会让「后来换了地址的图」再也装饰不了 —— 表现就是发一次消息后
+    // 复选框集体消失，只有彻底重启才恢复。
+    // 改用 S.boxes 判断；发现 box 已经不在 DOM 里（豆包重建了节点）就重建一个。
+    const old = S.boxes.get(img);
+    if (old) {
+      if (old.box.isConnected) return;
+      try { old.box.remove(); } catch (e) {}
+      try { old.hl.remove(); } catch (e) {}
+      S.boxes.delete(img);
+    }
     const src = img.currentSrc || img.src || '';
-    if (!CDN_RE.test(src)) return;
+    if (!isSelectable(src)) return;
 
     // 没加载完就先挂监听，等真图出来再装饰（否则这批图会永远被跳过）
     if (!img.complete || img.naturalWidth === 0) {
@@ -271,7 +286,7 @@
     if (r.width < MIN_PX || r.height < MIN_PX) return;
 
     const layer = ensureLayer();
-    img.__dbPick = true;
+
 
     // 选中时套在图片外面的高亮框（fixed：视口坐标直接用）
     const hl = document.createElement('div');
@@ -347,18 +362,36 @@
     refreshBar();
   }
 
-  function doCopy() {
+  // blob: / data: 的图主进程下不到（blob 只在渲染进程里有效），
+  // 先在页面里转成 dataURL 再传过去
+  async function toTransferable(url) {
+    if (!/^blob:/.test(url)) return url;
+    try {
+      const r = await fetch(url);
+      const b = await r.blob();
+      return await new Promise((res, rej) => {
+        const fr = new FileReader();
+        fr.onload = () => res(String(fr.result || ''));
+        fr.onerror = () => rej(new Error('读取失败'));
+        fr.readAsDataURL(b);
+      });
+    } catch (e) {
+      return url;
+    }
+  }
+
+  async function doCopy() {
     if (S.busy || !S.sel.size) return;
     S.busy = true;
-    const urls = Array.from(S.sel);
+    const urls = await Promise.all(Array.from(S.sel).map(toTransferable));
     tip('正在准备 ' + urls.length + ' 张图片…');
     send({ __dbPick: 'copy', urls });
   }
 
-  function doDownload() {
+  async function doDownload() {
     if (S.busy || !S.sel.size) return;
     S.busy = true;
-    const urls = Array.from(S.sel);
+    const urls = await Promise.all(Array.from(S.sel).map(toTransferable));
     tip('正在下载 ' + urls.length + ' 张图片…');
     send({ __dbPick: 'download', urls });
   }

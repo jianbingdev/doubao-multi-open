@@ -1536,6 +1536,24 @@ function writeFilesToClipboard(files) {
 // 下载单张图片。resolve 出来的扩展名按响应头决定（豆包 CDN 的 URL 常常没有后缀）
 function downloadImageTo(url, destBase) {
   return new Promise((resolve, reject) => {
+    // data: URL（页面里把 blob 转过来的）直接解码落盘，不用走网络
+    if (/^data:/i.test(url)) {
+      try {
+        const comma = url.indexOf(',');
+        const meta = url.slice(0, comma);
+        const ext = /svg\+xml/i.test(meta) ? 'svg'
+          : (/jpe?g/i.test(meta) ? 'jpg'
+          : (/webp/i.test(meta) ? 'webp'
+          : (/gif/i.test(meta) ? 'gif' : 'png')));
+        const buf = Buffer.from(url.slice(comma + 1), 'base64');
+        if (!buf.length) return reject(new Error('data URL 内容为空'));
+        const dest = destBase + '.' + ext;
+        fs.writeFileSync(dest, buf);
+        return resolve({ file: dest, bytes: buf.length, type: meta.slice(5, 40) });
+      } catch (e) {
+        return reject(new Error('data URL 解析失败: ' + e.message));
+      }
+    }
     let req;
     try {
       req = net.request({ method: 'GET', url, redirect: 'follow' });
@@ -1592,7 +1610,7 @@ function downloadImageTo(url, destBase) {
 // 规范化传入的图片 URL：只留 https、去重、一次最多 30 张
 function normalizeImageUrls(urls) {
   const src = (Array.isArray(urls) ? urls : [])
-    .filter((u) => typeof u === 'string' && /^https:\/\//i.test(u));
+    .filter((u) => typeof u === 'string' && (/^https:\/\//i.test(u) || /^data:image\//i.test(u)));
   return Array.from(new Set(src)).slice(0, 30);
 }
 
