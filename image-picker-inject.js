@@ -1,20 +1,30 @@
 // 图片多选复制 —— 注入到豆包页面主世界
 // 由 member-preload.js 用 webFrame.executeJavaScript 注入；通信走 window.postMessage。
-// 设计要点见 DEVLOG 34：选择状态用 URL 记（虚拟滚动会重建 DOM）、
-// 选择器锚在 CDN 域名上（class 是哈希名，豆包改版就变）。
+//
+// ⚠️ 关键设计（2026-10-28 踩坑后重写）：
+// 复选框**绝对不能**插进豆包的图片容器里。豆包的图片是这样渲染的：
+//   <SPAN><img src="data:image/svg+xml,..."></SPAN>   ← 先放 SVG 骨架占位
+//   等真图加载完再把骨架换成 <img src="https://pN-flow-imagex-sign.byteimg.com/...">
+// 一旦往那个 SPAN 里多塞一个 div（或改它的 position），豆包的替换逻辑就失败，
+// 图片明明加载好了却不显示 —— 表现就是「闪一下变成灰块」。
+//
+// 所以现在所有复选框都放在一个独立浮层里（挂在 body 上，pointer-events:none），
+// 位置靠 getBoundingClientRect 实时算。豆包的 DOM 一个字节都不动。
 (() => {
   if (window.__DB_PICK__) return;
   const S = {
-    sel: new Set(),          // 选中的图片 URL
-    boxes: new WeakMap(),    // img -> 复选框节点
+    sel: new Set(),        // 选中的图片 URL
+    boxes: new Map(),      // img -> { box, hl, tick, on }（Map 才能遍历做位置同步）
     bar: null,
-    busy: false
+    layer: null,
+    busy: false,
+    observer: null
   };
   window.__DB_PICK__ = S;
 
-  const MIN_PX = 60;                                                    // 小于这个尺寸当图标/头像，不管
-  const CDN_RE = /^https:\/\/p\d+-flow-imagex-sign\.byteimg\.com\//;    // 豆包图片 CDN
-  const TIP_ID = '__db_pick_tip';
+  const MIN_PX = 30;                 // 豆包头像/图标 20px，30 能排掉
+  const CDN_RE = /^https:\/\/p\d+-flow-imagex-sign\.byteimg\.com\//;
+  const GAP = 8;                     // 复选框离图片边缘的距离
 
   // ---------- 小工具 ----------
   const css = (el, o) => Object.assign(el.style, o);
@@ -22,7 +32,29 @@
     try { window.postMessage(JSON.stringify(payload), '*'); } catch (e) {}
   }
 
-  // ---------- 工具条（右下角浮动，只在有选中时出现）----------
+  // ---------- 浮层（唯一往 body 插的东西）----------
+  // ⚠️ 必须是 0×0：早先做成 width/height:100% 的全屏层，会让豆包的图片重新变成灰块
+  // （实测：全屏浮层 + GPU 开 = 0/15 张；0×0 容器待验证）。子元素各自 position:fixed，
+  // 用 getBoundingClientRect 的视口坐标直接定位，不依赖父容器尺寸。
+  function ensureLayer() {
+    if (S.layer && document.body.contains(S.layer)) return S.layer;
+    let el = document.getElementById('__db_pick_layer');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = '__db_pick_layer';
+      css(el, {
+        // z-index 保持很高：要盖在图片之上（否则方块会被图盖住看不见）。
+        // "别浮进输入框"是靠 syncPositions 里的边界判断解决的，不靠层级。
+        position: 'fixed', left: '0', top: '0', width: '0', height: '0',
+        zIndex: '2147482000', pointerEvents: 'none', overflow: 'visible'
+      });
+      document.body.appendChild(el);
+    }
+    S.layer = el;
+    return el;
+  }
+
+  // ---------- 工具条 ----------
   function ensureBar() {
     if (S.bar && document.body.contains(S.bar)) return S.bar;
     const bar = document.createElement('div');
@@ -46,25 +78,18 @@
       <div style="font-size:11px;color:rgba(255,255,255,.5);text-align:center;white-space:nowrap">Ctrl+C 复制 · 下载存到下载目录</div>`;
     document.body.appendChild(bar);
 
-    // 拦截按下类事件防止冒泡到豆包页面触发图片预览。
-    // click 不能拦！拦了按钮自己的 handler 就收不到（这个坑踩过两次）
+    // 只拦按下类事件；click 必须放行，不然按钮自己的 handler 收不到（踩过两次）
     ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'copy'].forEach((t) => {
       bar.addEventListener(t, (e) => e.stopPropagation(), true);
     });
     bar.querySelector('#__db_pick_copy').addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      doCopy();
+      e.preventDefault(); e.stopPropagation(); doCopy();
     });
     bar.querySelector('#__db_pick_download').addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      doDownload();
+      e.preventDefault(); e.stopPropagation(); doDownload();
     });
     bar.querySelector('#__db_pick_clear').addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      clearSel();
+      e.preventDefault(); e.stopPropagation(); clearSel();
     });
     S.bar = bar;
     return bar;
@@ -81,10 +106,10 @@
   // ---------- 提示气泡 ----------
   let tipTimer = null;
   function tip(msg, isErr) {
-    let el = document.getElementById(TIP_ID);
+    let el = document.getElementById('__db_pick_tip');
     if (!el) {
       el = document.createElement('div');
-      el.id = TIP_ID;
+      el.id = '__db_pick_tip';
       css(el, {
         position: 'fixed', left: '50%', bottom: '150px', transform: 'translateX(-50%)',
         zIndex: '2147483001', padding: '9px 16px', borderRadius: '10px',
@@ -101,43 +126,173 @@
     tipTimer = setTimeout(() => { el.style.opacity = '0'; }, isErr ? 3600 : 1800);
   }
 
-  // ---------- 复选框 ----------
+  // ---------- 位置同步（滚动 / 缩放 / 懒加载都会变）----------
+  // 找这张图所在的滚动容器（消息列表）。复选框只允许显示在它的可见区域内，
+  // 否则图片滚到顶栏/输入框后面时，框会"浮"到那些区域上（用户反馈过两个方向都有）。
+  function findScroller(el) {
+    let p = el.parentElement;
+    while (p && p !== document.body) {
+      try {
+        const oy = getComputedStyle(p).overflowY;
+        if (oy === 'auto' || oy === 'scroll') return p;
+      } catch (e) {}
+      p = p.parentElement;
+    }
+    return null;
+  }
+
+  // 判断某个元素是不是落在豆包输入框区域里。
+  // 用 elementFromPoint 反查最准：直接问浏览器"这个点最上层是谁"，
+  // 比拿坐标和输入框的 top 比较可靠 —— 输入框有内层(surface)和外框(圆角)两层，
+  // 两者 top 差几十像素，用哪个都会漏掉一半情况。
+  function isInputZone(el) {
+    try {
+      if (!el || !el.closest) return false;
+      if (el.closest('.guidance-input-surface')) return true;
+      if (el.closest('.guidance-input-content')) return true;
+      if (el.closest('.guidance-input-editor-viewport')) return true;
+      if (el.closest('[class*="rounded-dbx"]')) return true;   // 输入框外框
+      return false;
+    } catch (e) { return false; }
+  }
+
+  function syncPositions() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+
+    // 上下两条边界：
+    //   顶部 = 消息滚动容器的可见顶部（顶栏下沿那条线）
+    //   底部 = 豆包输入框外框的顶部
+    // 超出边界的部分用 clip-path 裁掉，线以内的部分照常显示 ——
+    // 不能整块 display:none（用户要求：超过线的部分消失，没超过的还展示出来）。
+    let inputTop = Infinity;
+    const ed = document.querySelector('[contenteditable="true"]');
+    if (ed) {
+      try {
+        const frame = ed.closest('[class*="rounded-dbx"]') || ed.closest('.guidance-input-surface') || ed;
+        const t = frame.getBoundingClientRect().top;
+        if (t > 120) inputTop = t;
+      } catch (e) {}
+    }
+
+    for (const [img, rec] of S.boxes) {
+      if (!img.isConnected) {
+        try { rec.box.remove(); } catch (e) {}
+        try { rec.hl.remove(); } catch (e) {}
+        S.boxes.delete(img);
+        continue;
+      }
+      const r = img.getBoundingClientRect();
+      const sc = rec.scroller || (rec.scroller = findScroller(img));
+      let topLimit = 0;
+      if (sc) {
+        try { topLimit = sc.getBoundingClientRect().top; } catch (e) {}
+      }
+
+      // 完全不可见才隐藏；有一点点露出来就显示（露出部分会被裁）
+      const anyVisible = r.width >= MIN_PX && r.height >= MIN_PX &&
+                         r.bottom > topLimit && r.right > 0 && r.left < vw &&
+                         (inputTop === Infinity || r.top < inputTop);
+      if (!anyVisible) {
+        rec.box.style.display = 'none';
+        rec.hl.style.display = 'none';
+        continue;
+      }
+
+      // 裁掉超出上下边界的部分
+      const topCut = Math.max(0, topLimit - r.top);
+      const botCut = inputTop === Infinity ? 0 : Math.max(0, r.bottom - inputTop);
+
+      // ---- 复选框（22×22，在图片左上角）----
+      const boxTop = r.top + GAP;
+      const bTopCut = Math.max(0, topLimit - boxTop);
+      const bBotCut = inputTop === Infinity ? 0 : Math.max(0, (boxTop + 22) - inputTop);
+      rec.box.style.display = 'flex';
+      rec.box.style.opacity = rec.on ? 1 : 0.55;
+      rec.box.style.left = Math.round(r.left + GAP) + 'px';
+      rec.box.style.top = Math.round(boxTop) + 'px';
+      rec.box.style.clipPath = 'inset(' + bTopCut + 'px 0px ' + bBotCut + 'px 0px)';
+
+      // ---- 选中时的蓝色描边框（整个图片的矩形）----
+      if (rec.on) {
+        rec.hl.style.display = 'block';
+        rec.hl.style.left = Math.round(r.left) + 'px';
+        rec.hl.style.top = Math.round(r.top) + 'px';
+        rec.hl.style.width = Math.round(r.width) + 'px';
+        rec.hl.style.height = Math.round(r.height) + 'px';
+        rec.hl.style.clipPath = 'inset(' + topCut + 'px 0px ' + botCut + 'px 0px)';
+      } else {
+        rec.hl.style.display = 'none';
+      }
+    }
+  }
+
+  let syncRaf = 0;
+  function scheduleSync() {
+    if (syncRaf) return;
+    syncRaf = requestAnimationFrame(() => { syncRaf = 0; syncPositions(); });
+  }
+
+  // ---------- 复选框（全部活在浮层里）----------
+  function paint(rec, on) {
+    rec.on = on;
+    rec.box.style.background = on ? '#4F86F7' : 'rgba(255,255,255,.92)';
+    rec.box.style.borderColor = on ? '#4F86F7' : 'rgba(0,0,0,.14)';
+    rec.box.style.opacity = on ? '1' : '0.55';
+    rec.tick.style.opacity = on ? '1' : '0';
+    if (on) {
+      rec.hl.style.display = 'block';
+      rec.hl.style.border = '3px solid #4F86F7';
+    } else {
+      rec.hl.style.display = 'none';
+    }
+  }
+
   function decorate(img) {
-    if (img.__dbPick) return;
-    const w = img.offsetWidth, h = img.offsetHeight;
-    if (w < MIN_PX || h < MIN_PX) return;
+    if (img.__dbPick || S.boxes.has(img)) return;
     const src = img.currentSrc || img.src || '';
     if (!CDN_RE.test(src)) return;
 
-    const host = img.parentElement;
-    if (!host) return;
+    // 没加载完就先挂监听，等真图出来再装饰（否则这批图会永远被跳过）
+    if (!img.complete || img.naturalWidth === 0) {
+      if (!img.__dbPickWait) {
+        img.__dbPickWait = true;
+        const retry = () => {
+          img.__dbPickWait = false;
+          setTimeout(() => { decorate(img); syncPositions(); }, 60);
+        };
+        img.addEventListener('load', retry, { once: true });
+        img.addEventListener('error', retry, { once: true });
+      }
+      return;
+    }
 
+    // 尺寸用 rect：豆包有容器带 transform:scale()，offsetWidth 是布局尺寸
+    const r = img.getBoundingClientRect();
+    if (r.width < MIN_PX || r.height < MIN_PX) return;
+
+    const layer = ensureLayer();
     img.__dbPick = true;
-    try {
-      const pos = getComputedStyle(host).position;
-      if (pos === 'static') host.style.position = 'relative';
-    } catch (e) {}
 
-    // 用 div 而不是 label：label 会把点击转发给 input，容易触发两次
+    // 选中时套在图片外面的高亮框（fixed：视口坐标直接用）
+    const hl = document.createElement('div');
+    hl.className = '__db_pick_hl';
+    css(hl, {
+      position: 'fixed', display: 'none', pointerEvents: 'none',
+      borderRadius: '6px', boxSizing: 'border-box'
+    });
+
+    // 复选框本体
     const box = document.createElement('div');
     box.className = '__db_pick_box';
     css(box, {
-      position: 'absolute', top: '8px', left: '8px', zIndex: '2147482000',
-      width: '22px', height: '22px', borderRadius: '7px', cursor: 'pointer',
+      position: 'fixed', width: '22px', height: '22px', borderRadius: '7px',
+      cursor: 'pointer', pointerEvents: 'auto',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       background: 'rgba(255,255,255,.92)', border: '1.5px solid rgba(0,0,0,.14)',
       boxShadow: '0 2px 8px rgba(0,0,0,.18)',
       transition: 'opacity .12s ease, background .12s ease, border-color .12s ease',
-      opacity: '0.55'   // 常驻半透明；悬停到 1，选中也是 1
+      opacity: '0.55'
     });
-
-    // 真正的 checkbox 只用来存状态，视觉完全自己画（对号必须够显眼）
-    const cb = document.createElement('input');
-    cb.type = 'checkbox';
-    cb.checked = S.sel.has(src);
-    css(cb, { position: 'absolute', width: '1px', height: '1px', opacity: '0', pointerEvents: 'none' });
-    box.appendChild(cb);
-
     const tick = document.createElement('span');
     tick.textContent = '✓';
     css(tick, {
@@ -147,31 +302,15 @@
     });
     box.appendChild(tick);
 
-    // 统一改视觉的地方，避免各处手写颜色
-    function paint(on) {
-      cb.checked = on;
-      box.style.background = on ? '#4F86F7' : 'rgba(255,255,255,.92)';
-      box.style.borderColor = on ? '#4F86F7' : 'rgba(0,0,0,.14)';
-      tick.style.opacity = on ? '1' : '0';
-      box.style.opacity = on ? '1' : '0.55';
-      try {
-        host.style.outline = on ? '3px solid #4F86F7' : '';
-        host.style.outlineOffset = on ? '-3px' : '';
-      } catch (e) {}
-    }
-    paint(S.sel.has(src));
-    box.__paint = paint;   // 清空选择时统一调用，避免各处手画颜色
+    const rec = { box: box, hl: hl, tick: tick, on: false };
+    layer.appendChild(hl);
+    layer.appendChild(box);
+    S.boxes.set(img, rec);
 
-    // 常驻半透明，鼠标移上去才完全实心；已选中的一直实心
-    const show = () => { box.style.opacity = '1'; };
-    const hide = () => { if (!S.sel.has(src)) box.style.opacity = '0.55'; };
-    host.addEventListener('mouseenter', show);
-    host.addEventListener('mouseleave', hide);
-
-    // 只拦鼠标按下/抬起这类会触发豆包图片预览的事件；
-    // click 必须放行，否则自己的 handler 收不到（踩过两次）
+    box.addEventListener('mouseenter', () => { box.style.opacity = '1'; });
+    box.addEventListener('mouseleave', () => { if (!rec.on) box.style.opacity = '0.55'; });
     ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'dblclick'].forEach((t) => {
-      box.addEventListener(t, (e) => { e.stopPropagation(); }, true);
+      box.addEventListener(t, (e) => { e.stopPropagation(); e.preventDefault(); }, true);
     });
     box.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -180,66 +319,53 @@
       if (!now) return;
       const on = !S.sel.has(now);
       if (on) S.sel.add(now); else S.sel.delete(now);
-      paint(on);
+      paint(rec, on);
       refreshBar();
+      syncPositions();
     });
 
-    host.appendChild(box);
-    S.boxes.set(img, box);
+    if (S.sel.has(src)) paint(rec, true);
+    syncPositions();
   }
 
-  // ---------- 扫描（虚拟滚动会不断重建 DOM，所以要反复扫）----------
+  // ---------- 扫描 ----------
   let scanTimer = null;
   function scan() {
     const imgs = document.querySelectorAll('img');
     for (let i = 0; i < imgs.length; i++) decorate(imgs[i]);
+    syncPositions();
   }
   function scheduleScan() {
     if (scanTimer) return;
     scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 220);
   }
 
-  // ---------- 选中/清空 ----------
+  // ---------- 选中 / 清空 ----------
   function clearSel() {
     S.sel.clear();
-    document.querySelectorAll('.__db_pick_box').forEach((box) => {
-      if (typeof box.__paint === 'function') {
-        box.__paint(false);
-        return;
-      }
-      // 兜底：万一 paint 没挂上（老节点）
-      box.style.opacity = '0.55';
-      const cb = box.querySelector('input');
-      if (cb) cb.checked = false;
-      const host = box.parentElement;
-      if (host) { host.style.outline = ''; host.style.outlineOffset = ''; }
-    });
+    for (const [, rec] of S.boxes) paint(rec, false);
     refreshBar();
   }
 
   function doCopy() {
-    if (S.busy) return;
-    if (!S.sel.size) return;
+    if (S.busy || !S.sel.size) return;
     S.busy = true;
     const urls = Array.from(S.sel);
     tip('正在准备 ' + urls.length + ' 张图片…');
-    // 交给 preload -> 主进程下载并写剪贴板
     send({ __dbPick: 'copy', urls });
   }
 
-  // 批量下载：不碰剪贴板，直接存到「下载目录\图片-<时间戳>\」
   function doDownload() {
-    if (S.busy) return;
-    if (!S.sel.size) return;
+    if (S.busy || !S.sel.size) return;
     S.busy = true;
     const urls = Array.from(S.sel);
     tip('正在下载 ' + urls.length + ' 张图片…');
     send({ __dbPick: 'download', urls });
   }
 
-  // ---------- 拦截 Ctrl+C（capture 阶段抢在豆包前面）----------
+  // ---------- 拦截 Ctrl+C ----------
   function onCopy(e) {
-    if (!S.sel.size) return;                 // 没选图就放行，正常复制文字
+    if (!S.sel.size) return;
     e.preventDefault();
     e.stopPropagation();
     if (e.clipboardData) { try { e.clipboardData.setData('text/plain', ''); } catch (err) {} }
@@ -249,14 +375,16 @@
   // ---------- 启动 ----------
   function boot() {
     if (!document.body) { setTimeout(boot, 300); return; }
+    ensureLayer();
     ensureBar();
     scan();
     S.observer = new MutationObserver(scheduleScan);
     S.observer.observe(document.body, { childList: true, subtree: true });
     document.addEventListener('copy', onCopy, true);
-    // 滚动后尺寸才确定的图片，补扫一次
-    window.addEventListener('scroll', scheduleScan, { passive: true });
-    window.addEventListener('resize', scheduleScan, { passive: true });
+    window.addEventListener('scroll', scheduleSync, { passive: true, capture: true });
+    window.addEventListener('resize', scheduleSync, { passive: true });
+    // 图片加载完、布局微调时位置会变，低频兜底同步一次
+    setInterval(scheduleSync, 800);
   }
 
   // 主进程回传结果

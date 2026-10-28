@@ -84,6 +84,11 @@ try {
 // 通信链路：页面主世界 postMessage → preload(隔离世界) → ipcRenderer.invoke → 主进程
 //          主进程结果 → preload → postMessage 回页面主世界
 (function initImagePicker() {
+  // 排查开关：设了 DB_NO_PICKER=1 就完全不注入，用来对比"是不是选择器导致的问题"
+  if (process.env.DB_NO_PICKER === '1') {
+    __diag('图片选择器: 已通过环境变量禁用');
+    return;
+  }
   const { ipcRenderer } = require('electron');
   const fs = require('fs');
   const path = require('path');

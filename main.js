@@ -108,7 +108,12 @@ const PREFS_FILE = path.join(USER_DIR, 'prefs.json');
 function loadPrefs() {
   try { return JSON.parse(fs.readFileSync(PREFS_FILE, 'utf-8')); } catch (e) { return {}; }
 }
-let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '' }, loadPrefs());
+// compatGpu 默认 false（保留 GPU 加速）。
+// 2026-10-28 排查结论：豆包的图片变成灰块，根因是「往页面插全屏合成层」——
+// 早期版本把复选框插进图片容器、后来又把浮层做成 width/height:100%，都会触发。
+// 改成 0×0 容器 + 子元素 fixed 定位后，GPU 开着也正常（实测 4/4 张 CDN 图全加载）。
+// 这个开关留着是兜底：万一某些机器上仍有问题，手动设 true 即可退化成软件渲染。
+let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '', compatGpu: false }, loadPrefs());
 function savePrefs() {
   try {
     fs.mkdirSync(USER_DIR, { recursive: true });
