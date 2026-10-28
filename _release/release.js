@@ -402,15 +402,10 @@ function zipCore(ver) {
     if (!fs.existsSync(src)) die('缺少应用文件: ' + f);
     fs.copyFileSync(src, path.join(stageApp, f));
   }
-  const docs = path.join(ROOT, 'docs');
-  if (fs.existsSync(docs)) {
-    const out = path.join(stageApp, 'docs');
-    fs.mkdirSync(out, { recursive: true });
-    for (const f of fs.readdirSync(docs)) {
-      const s = path.join(docs, f);
-      if (fs.statSync(s).isFile()) fs.copyFileSync(s, path.join(out, f));
-    }
-  }
+  // docs 是 README 里的截图（5 张 PNG，约 340 KB）。core 包不带：
+  // ① 它是增量更新包，职责只是替换代码；
+  // ② 1Panel 的上传上限是 512 KB（524288 字节），带上就超了，超了会被静默丢弃。
+  // 完整包（buildPortable）仍然带 docs，首次安装的用户照样能看到截图。
   fs.writeFileSync(path.join(stageApp, 'package.json'), leanPackageJson(ver), 'utf8');
 
   const distDir = path.join(__dirname, 'dist');
