@@ -12,7 +12,7 @@
 //    7. 权限请求白名单; 关窗最小化到托盘(可关); 单实例锁
 //    8. 登录监控防重入、定时器必清; 昵称提取只在登录成功时执行一次
 // ============================================================
-const { app, BrowserWindow, WebContentsView, ipcMain, Menu, session, shell, Tray, nativeImage, dialog, screen, net } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu, session, shell, Tray, nativeImage, dialog, screen, net, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -1488,6 +1488,174 @@ function ShowMain() {
 }
 
 // ---------- IPC ----------
+
+// ===== 图片多选复制（v4.2.2）=====
+// 页面里选中若干图片后按 Ctrl+C，preload 把 URL 列表发过来：
+// 主进程逐张下载（必须走主进程，CDN 跨域，页面内 fetch 会被 CORS 拦）→
+// 写到 userdata\_clip\ → 以 CF_HDROP（多文件）形式写进剪贴板。
+// 用户在微信/资源管理器/豆包输入框里 Ctrl+V 就能全部粘出来。
+const CLIP_DIR = path.join(USER_DIR, '_clip');
+
+// 多个文件写进剪贴板。
+// 为什么不用 clipboard.writeBuffer('CF_HDROP')：Electron 的 writeBuffer 走的是
+// RegisterClipboardFormat(字符串)，传 "CF_HDROP" 只会注册出一个**同名的自定义格式**，
+// 不是系统预定义的 CF_HDROP(15)，资源管理器 / 微信 / 豆包全都读不到（实测过）。
+// 所以借 PowerShell 的 Set-Clipboard 来写，它会正确写 CF_HDROP。
+// 用 spawn 而不是 execFileSync，避免剪贴板被别的程序占着时把主进程卡住 15 秒。
+function writeFilesToClipboard(files) {
+  return new Promise((resolve, reject) => {
+    if (process.platform !== 'win32') {
+      // 非 Windows 没有 CF_HDROP，退回单图（够用就行）
+      try { clipboard.writeImage(nativeImage.createFromPath(files[0])); resolve(); }
+      catch (e) { reject(e); }
+      return;
+    }
+    const quoted = files.map((f) => "'" + String(f).replace(/'/g, "''") + "'").join(',');
+    const script = 'Set-Clipboard -LiteralPath @(' + quoted + ')';
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true });
+    let errText = '';
+    if (child.stderr) child.stderr.on('data', (d) => { errText += d.toString(); });
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch (e) {}
+      reject(new Error('写剪贴板超时（剪贴板可能被其他程序占着）'));
+    }, 15000);
+    child.on('error', (e) => { clearTimeout(timer); reject(new Error('调用 PowerShell 失败: ' + e.message)); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error('写剪贴板失败(exit ' + code + '): ' + errText.trim().slice(0, 120)));
+    });
+  });
+}
+
+// 下载单张图片。resolve 出来的扩展名按响应头决定（豆包 CDN 的 URL 常常没有后缀）
+function downloadImageTo(url, destBase) {
+  return new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = net.request({ method: 'GET', url, redirect: 'follow' });
+    } catch (e) {
+      return reject(new Error('地址无效: ' + e.message));
+    }
+    // CDN 校验 Referer，不带的话会 403
+    req.setHeader('User-Agent', CHROME_UA);
+    req.setHeader('Referer', 'https://www.doubao.com/');
+    req.setHeader('Accept', 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8');
+
+    let settled = false;
+    let ws = null;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      try { req.abort(); } catch (e) {}
+      if (ws) { try { ws.destroy(); } catch (e) {} }
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    req.on('response', (res) => {
+      if (res.statusCode >= 400) {
+        res.on('data', () => {});
+        return fail(new Error('HTTP ' + res.statusCode));
+      }
+      const ctRaw = res.headers['content-type'];
+      const ct = Array.isArray(ctRaw) ? ctRaw[0] : (ctRaw || '');
+      let ext = 'jpg';
+      if (/png/i.test(ct)) ext = 'png';
+      else if (/webp/i.test(ct)) ext = 'webp';
+      else if (/gif/i.test(ct)) ext = 'gif';
+      const dest = destBase + '.' + ext;
+
+      ws = fs.createWriteStream(dest);
+      let bytes = 0;
+      res.on('data', (c) => { bytes += c.length; });
+      res.pipe(ws);
+      ws.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        // 太小基本可以确定不是图片（比如错误页）
+        if (bytes < 64) return reject(new Error('响应只有 ' + bytes + ' 字节，不是有效图片'));
+        resolve({ file: dest, bytes: bytes, type: ct });
+      });
+      ws.on('error', (e) => fail(new Error('写入失败: ' + e.message)));
+      res.on('error', (e) => fail(new Error('接收失败: ' + e.message)));
+    });
+    req.on('error', (e) => fail(e));
+    req.end();
+  });
+}
+
+// 规范化传入的图片 URL：只留 https、去重、一次最多 30 张
+function normalizeImageUrls(urls) {
+  const src = (Array.isArray(urls) ? urls : [])
+    .filter((u) => typeof u === 'string' && /^https:\/\//i.test(u));
+  return Array.from(new Set(src)).slice(0, 30);
+}
+
+// 把一批 URL 下载到 dir（下载前先清空）。返回 { files, errors }
+async function fetchImagesTo(dir, urls, tag) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+  fs.mkdirSync(dir, { recursive: true });
+  const files = [];
+  const errors = [];
+  for (let i = 0; i < urls.length; i++) {
+    const base = path.join(dir, String(i + 1).padStart(2, '0'));
+    try {
+      const r = await downloadImageTo(urls[i], base);
+      files.push(r.file);
+      log(tag + ': 第 ' + (i + 1) + ' 张 ' + humanSize(r.bytes) + ' ' + r.type);
+    } catch (err) {
+      errors.push('第 ' + (i + 1) + ' 张: ' + err.message);
+      log(tag + '失败: 第 ' + (i + 1) + ' 张 ' + err.message);
+    }
+  }
+  return { files: files, errors: errors };
+}
+
+// 本地时间戳，用于给下载目录命名（group 一批图片）
+function localStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' +
+    p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+ipcMain.handle('images:copy', async (e, urls) => {
+  try {
+    const uniq = normalizeImageUrls(urls);
+    if (!uniq.length) return { ok: false, error: '没有可复制的图片' };
+    // 每次都清掉上一批，免得剪贴板指向已经被覆盖或删掉的文件
+    const r = await fetchImagesTo(CLIP_DIR, uniq, '图片复制');
+    if (!r.files.length) return { ok: false, error: r.errors[0] || '全部下载失败' };
+
+    await writeFilesToClipboard(r.files);
+    log('图片已写入剪贴板: ' + r.files.length + ' 张' + (r.errors.length ? '（失败 ' + r.errors.length + '）' : ''));
+    return { ok: true, action: 'copy', count: r.files.length, failed: r.errors.length, errors: r.errors };
+  } catch (err) {
+    log('图片复制整体失败: ' + ((err && err.message) || err));
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+});
+
+// 批量下载：不碰剪贴板，直接落盘到「下载目录\图片-<时间戳>\」
+ipcMain.handle('images:download', async (e, urls) => {
+  try {
+    const uniq = normalizeImageUrls(urls);
+    if (!uniq.length) return { ok: false, error: '没有可下载的图片' };
+    const baseDir = getDownloadDir();
+    if (!baseDir) return { ok: false, error: '没有可用的下载目录，请在设置里指定' };
+
+    const dir = path.join(baseDir, '图片-' + localStamp());
+    const r = await fetchImagesTo(dir, uniq, '图片下载');
+    if (!r.files.length) return { ok: false, error: r.errors[0] || '全部下载失败' };
+
+    log('图片已下载: ' + r.files.length + ' 张 → ' + dir);
+    return { ok: true, action: 'download', count: r.files.length, failed: r.errors.length, dir: dir, errors: r.errors };
+  } catch (err) {
+    log('图片下载整体失败: ' + ((err && err.message) || err));
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+});
+
 ipcMain.handle('accounts:list', () => {
   const accounts = loadAccounts();
   const now = Date.now();
@@ -1637,7 +1805,6 @@ const APP_VERSION = (() => {
   try { return String(require(path.join(APP_DIR, 'package.json')).version || '0.0.0'); }
   catch (e) { return '0.0.0'; }
 })();
-const APP_VERSION_LABEL = 'v' + APP_VERSION;
 const UPDATE_DIR = path.join(USER_DIR, '_update');
 // 兜底更新源: 仓库的 Releases(latest)。未在设置里填自定义地址时用它。
 const GH_REPO = 'jianbingdev/doubao-multi-open';
@@ -2172,7 +2339,7 @@ function restoreUpdateState() {
 
 ipcMain.handle('app:info', () => ({
   version: APP_VERSION,
-  versionLabel: APP_VERSION_LABEL,
+  versionLabel: 'v' + APP_VERSION,
   packaged: app.isPackaged,
   dataDir: USER_DIR,
   updateUrl: prefs.updateUrl || ''

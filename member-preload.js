@@ -78,3 +78,63 @@ try {
 } catch (e) {
   __diag('executeJavaScript 抛错: ' + (e && e.message));
 }
+
+// ========== 图片多选复制（v4.2.2）==========
+// 注入代码放在独立文件 image-picker-inject.js，改逻辑不用动这里。
+// 通信链路：页面主世界 postMessage → preload(隔离世界) → ipcRenderer.invoke → 主进程
+//          主进程结果 → preload → postMessage 回页面主世界
+(function initImagePicker() {
+  const { ipcRenderer } = require('electron');
+  const fs = require('fs');
+  const path = require('path');
+
+  const file = path.join(__dirname, 'image-picker-inject.js');
+  if (!fs.existsSync(file)) {
+    __diag('图片选择器: 找不到 image-picker-inject.js, 跳过');
+    return;
+  }
+
+  const parsed = (raw) => {
+    if (typeof raw !== 'string') return raw;
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  };
+
+  // 页面 -> 主进程（action: copy | download）
+  window.addEventListener('message', (e) => {
+    const d = parsed(e.data);
+    if (!d || !Array.isArray(d.urls) || !d.urls.length) return;
+    const action = d.__dbPick;
+    if (action !== 'copy' && action !== 'download') return;
+
+    __diag('图片' + (action === 'copy' ? '复制' : '下载') + '请求: ' + d.urls.length + ' 张');
+    ipcRenderer.invoke('images:' + action, d.urls)
+      .then((r) => {
+        __diag('图片' + action + '结果: ' + JSON.stringify(r && { ok: r.ok, count: r.count, error: r.error }));
+        window.postMessage(JSON.stringify({
+          __dbPickResult: true,
+          action: action,
+          ok: !!(r && r.ok),
+          count: (r && r.count) || 0,
+          failed: (r && r.failed) || 0,
+          dir: (r && r.dir) || '',
+          error: (r && r.error) || ''
+        }), '*');
+      })
+      .catch((err) => {
+        const msg = (err && err.message) ? err.message : String(err);
+        __diag('图片' + action + '异常: ' + msg);
+        window.postMessage(JSON.stringify({
+          __dbPickResult: true, action: action, ok: false, error: msg
+        }), '*');
+      });
+  });
+
+  try {
+    const code = fs.readFileSync(file, 'utf-8');
+    webFrame.executeJavaScript(code)
+      .then(() => __diag('图片选择器注入 OK'))
+      .catch((e) => __diag('图片选择器注入失败: ' + (e && e.message)));
+  } catch (e) {
+    __diag('图片选择器读取失败: ' + (e && e.message));
+  }
+})();

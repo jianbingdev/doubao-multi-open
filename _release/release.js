@@ -163,7 +163,7 @@ function bumpVersion(ver) {
 }
 
 // ---------- 构建便携版 ----------
-const APP_FILES = ['main.js', 'preload.js', 'member-preload.js', 'index.html', 'renderer.js', 'app.ico', 'README.md', 'LICENSE'];
+const APP_FILES = ['main.js', 'preload.js', 'member-preload.js', 'image-picker-inject.js', 'index.html', 'renderer.js', 'app.ico', 'README.md', 'LICENSE'];
 
 // 清空/删除一个目录。
 // 不能用 fs.rmSync(recursive): 本机安全策略对"单次删除超过 50 个文件"会直接拒绝,
@@ -534,7 +534,7 @@ function fullNotes(ver, body) {
 // ---------- 推源码 ----------
 // 推送到 main 的文件清单。注意 app.ico 是二进制, 走 blob API 时用 base64。
 // v4.2: 补 app.ico(之前漏了, 换图标后源码里还是旧的) 和发版脚本本身。
-const SRC_FILES = ['main.js', 'preload.js', 'member-preload.js', 'index.html', 'renderer.js', 'package.json', 'package-lock.json', 'README.md', 'app.ico', '_release/release.js'];
+const SRC_FILES = ['main.js', 'preload.js', 'member-preload.js', 'image-picker-inject.js', 'index.html', 'renderer.js', 'package.json', 'package-lock.json', 'README.md', 'app.ico', '_release/release.js'];
 // 本次的更新说明也要带上(文件名随版本号变, 在 pushSource 里动态补)
 
 async function pushSource(ver, notesBody) {
