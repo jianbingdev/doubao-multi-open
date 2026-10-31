@@ -392,6 +392,25 @@ function leanPackageJson(ver) {
 //   * v4.0 及更早的客户端只会把整包解压后 robocopy 到安装根目录,
 //     有了这层结构, 文件正好落到 resources\app 里 —— 旧版也能一次到位,
 //     不用为了让老客户端升级而下 140 MB 的完整包。
+// 发版前清掉开发标识。
+// 工作区的 main.js 带着 APP_VERSION_LABEL = '开发版vX'（侧栏和关于窗口会显示），
+// README 徽章是 vX--dev。这些都是开发时看的，不能进发布包，
+// 更不能推上公开仓 —— 4.2.4 就是漏了这一步，下载包的用户看到了「开发版v4.2.4」。
+function sanitizeFile(relPath, content) {
+  const before = content.toString('utf-8');
+  let s = before;
+  if (relPath === 'main.js') {
+    s = s.replace(/^const APP_VERSION_LABEL = '[^']*';\r?\n/m, '');
+    s = s.replace(/message: '豆包多开管理器 ' \+ APP_VERSION_LABEL,/, "message: '豆包多开管理器 v' + APP_VERSION,");
+    s = s.replace(/versionLabel: APP_VERSION_LABEL,/, "versionLabel: 'v' + APP_VERSION,");
+  } else if (relPath === 'README.md') {
+    s = s.replace(/(version-[\d.]+)--dev/g, '$1');
+  }
+  if (s === before) return content;
+  console.log('   清理开发标识: ' + relPath + '  (' + before.length + ' → ' + s.length + ' 字节)');
+  return Buffer.from(s, 'utf-8');
+}
+
 function zipCore(ver) {
   const stage = path.join(__dirname, 'build', 'core-v' + ver);
   wipeDir(stage);
@@ -400,7 +419,8 @@ function zipCore(ver) {
   for (const f of APP_FILES) {
     const src = path.join(ROOT, f);
     if (!fs.existsSync(src)) die('缺少应用文件: ' + f);
-    fs.copyFileSync(src, path.join(stageApp, f));
+    // main.js / README.md 要过一遍 sanitize，其余原样复制
+    fs.writeFileSync(path.join(stageApp, f), sanitizeFile(f, fs.readFileSync(src)));
   }
   // docs 是 README 里的截图（5 张 PNG，约 340 KB）。core 包不带：
   // ① 它是增量更新包，职责只是替换代码；
@@ -546,7 +566,7 @@ async function pushSource(ver, notesBody) {
   for (const f of files) {
     const p = path.join(ROOT, f);
     if (!fs.existsSync(p)) die('缺少源文件: ' + f);
-    const content = fs.readFileSync(p);
+    const content = sanitizeFile(f, fs.readFileSync(p));
     const blob = await gh('POST', `/repos/${OWNER}/${REPO}/git/blobs`, {
       content: content.toString('base64'),
       encoding: 'base64'

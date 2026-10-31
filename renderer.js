@@ -294,10 +294,19 @@ function formatNotes(raw) {
   if (start >= 0) {
     let end = lines.length;
     for (let i = start + 1; i < lines.length; i++) {
-      if (/^#{1,3}\s+\S/.test(lines[i])) { end = i; break; }
+      // 章节结束只认 # 和 ##。
+      // 原来写 #{1,3}，遇到 ### 新增 这种子标题就提前截断，
+      // 结果 [## 本次更新] 和 [### 新增] 之间只剩空行 → 整个说明显示成空白。
+      if (/^#{1,2}\s+\S/.test(lines[i])) { end = i; break; }
     }
     lines = lines.slice(start + 1, end);
   }
+
+  // ### 子标题转成【】形式，不然屏幕上直接显示三个井号
+  lines = lines.map((l) => {
+    const m = String(l).trim().match(/^###\s+(.+)$/);
+    return m ? '【' + m[1] + '】' : l;
+  });
 
   // 整段丢掉 GitHub 的 > [!IMPORTANT] 提示块和普通引用
   const kept = [];

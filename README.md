@@ -1,6 +1,6 @@
 # 豆包多开管理器
 
-![version](https://img.shields.io/badge/version-4.2.4--dev-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-4.2.4-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
 
 > 本分支为**测试版v4.2**：在 v4.2 基础上加了后台下载与弹窗防误关，尚未正式发布。
 

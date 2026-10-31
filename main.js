@@ -1476,7 +1476,7 @@ function buildAppMenu() {
               .showMessageBox(mainWindow, {
                 type: 'info',
                 title: '关于',
-                message: '豆包多开管理器 ' + APP_VERSION_LABEL,
+                message: '豆包多开管理器 v' + APP_VERSION,
                 detail:
                   '数据目录: ' + USER_DIR + '\n\n' +
                   '原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。\n\n' +
@@ -2311,7 +2311,6 @@ const APP_VERSION = (() => {
   try { return String(require(path.join(APP_DIR, 'package.json')).version || '0.0.0'); }
   catch (e) { return '0.0.0'; }
 })();
-const APP_VERSION_LABEL = '开发版v4.2.4';
 const UPDATE_DIR = path.join(USER_DIR, '_update');
 // 兜底更新源: 仓库的 Releases(latest)。未在设置里填自定义地址时用它。
 const GH_REPO = 'jianbingdev/doubao-multi-open';
@@ -2893,7 +2892,7 @@ function restoreUpdateState() {
 
 ipcMain.handle('app:info', () => ({
   version: APP_VERSION,
-  versionLabel: APP_VERSION_LABEL,
+  versionLabel: 'v' + APP_VERSION,
   packaged: app.isPackaged,
   dataDir: USER_DIR,
   updateUrl: prefs.updateUrl || ''
