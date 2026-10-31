@@ -69,17 +69,6 @@ function render() {
       checkOne(acc, badge);
     };
 
-    const del = document.createElement('button');
-    del.className = 'del';
-    del.textContent = '×';
-    del.title = '删除此账号(含其全部本地数据)';
-    del.onclick = async (e) => {
-      e.stopPropagation();
-      if (!confirm('删除账号「' + acc.label + '」?\n该账号的登录态与页面数据会一并清理。')) return;
-      await window.api.accountsDelete(acc.id);
-      if (currentId === acc.id) currentId = null;
-      refresh();
-    };
 
     item.appendChild(avatar);
     item.appendChild(span);
@@ -101,7 +90,12 @@ function render() {
       item.appendChild(doneTag);
     }
     item.appendChild(badge);
-    item.appendChild(del);
+    // 右键菜单：刷新页面 / 刷新账号 / 删除（删除有二次确认）
+    item.oncontextmenu = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      window.api.accountsContextMenu(acc.id);
+    };
     item.onclick = () => {
       if (editing) return;
       if (currentId === acc.id) return; // 重复点同一个账号不重绘(双击改名的前提)
@@ -591,6 +585,192 @@ updClose.onclick = closeUpdateModal;
 // 两个弹窗都只认右上角的 ×: 点弹窗外面、按 Esc 都不再关窗。
 // 原来点外面一下就关, 更新弹窗里正在下载的进度说没就没, 误触代价太大。
 // Enter 仍然走更新弹窗的主按钮(立即更新·重启并更新)。
+
+// ============ 删除账号二次确认（HTML 弹窗，原生 dialog 改不了样式）============
+(function initDeleteConfirm() {
+  const mask = document.getElementById('delMask');
+  if (!mask) return;
+  const titleEl = document.getElementById('delTitle');
+  const okBtn = document.getElementById('delOk');
+  const cancelBtn = document.getElementById('delCancel');
+  const closeBtn = document.getElementById('delClose');
+  let pendingId = null;
+
+  function close() {
+    mask.hidden = true;
+    pendingId = null;
+    try { api.uiModal(false); } catch (e) {}
+  }
+
+  function open(id, label) {
+    pendingId = id;
+    titleEl.textContent = '删除账号「' + (label || id) + '」？';
+    mask.hidden = false;
+    mask.focus();
+    try { api.uiModal(true); } catch (e) {}
+  }
+
+  okBtn.addEventListener('click', async () => {
+    const id = pendingId;
+    if (!id) return close();
+    okBtn.disabled = true;
+    try {
+      await api.accountsDelete(id);
+    } catch (e) {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    okBtn.disabled = false;
+    if (currentId === id) currentId = null;
+    close();
+    try { refresh(); } catch (e) {}
+  });
+
+  cancelBtn.addEventListener('click', close);
+  closeBtn.addEventListener('click', close);
+
+  if (api.onConfirmDelete) api.onConfirmDelete((d) => {
+    if (d && d.id) open(d.id, d.label);
+  });
+})();
+
+
+// ============ 更新日志（只记新增 / 优化 / 修复）============
+const CHANGELOG = [
+  {
+    v: '4.2.4',
+    items: [
+      ['new', '批量发送：同一段话（可带图）一次发给多个账号，可设间隔、可中途停止'],
+      ['new', '生成视频页：画面比例、时长滑轨（4-30 秒）、清晰度，发送时自动拼成「生成视频：xxx / 9:16，15s，720p」'],
+      ['new', '图片可以直接拖进窗口；缩略图可拖动调整发送顺序，最多 10 张（豆包上限）'],
+      ['new', '检测账号：新建对话并发一句「你好豆包」，用来发现账号是否要输验证码'],
+      ['new', '账号右键菜单：刷新页面 / 刷新账号 / 删除账号（删除有二次确认）'],
+      ['new', '帮助 → 更新日志，能看 4.0 以来每版改了什么'],
+      ['imp', '生成状态轮询按需降频（空闲 700ms → 4 秒），并去掉每 800ms 一次的图片位置兜底扫描'],
+      ['imp', '新增内存回收：超过 3GB 自动清缓存，也可以从帮助菜单手动清'],
+      ['imp', '批量发送弹窗加宽到 520，一屏放得下不用滚'],
+      ['fix', '切换账号后右侧空白（视图挂载漏了 setVisible）'],
+      ['fix', '拖动缩略图排序失效（拖文件监听把事件吃掉了）']
+    ]
+  },
+  {
+    v: '4.2.3',
+    items: [
+      ['new', '自己粘贴进豆包的图也能被勾选复制'],
+      ['fix', '发一次消息后复选框集体消失、必须重启软件才恢复']
+    ]
+  },
+  {
+    v: '4.2.2',
+    items: [
+      ['new', '图片多选复制：鼠标移到图片上出现复选框，勾选多张后 Ctrl+C 一次复制所有原图'],
+      ['new', '批量下载：勾选后一次下到「图片-时间戳」文件夹'],
+      ['imp', '复选框常驻半透明显示，懒加载的图加载完会自动补上，小图（30px 以上）也能选'],
+      ['fix', '豆包页面的图片变成灰色方块']
+    ]
+  },
+  {
+    v: '4.2.1',
+    items: [
+      ['new', '更新包后台下载：下载中可以关掉弹窗继续用，进度显示在左侧版本徽标上'],
+      ['imp', '下载完成的提示从右下角挪到左侧栏（原来被账号页面盖住看不到）'],
+      ['imp', '更新弹窗、设置弹窗只能点右上角 × 关闭，避免误关'],
+      ['fix', '下载中再点「检查更新」会误报「已经是最新版本」'],
+      ['fix', '下载失败时没释放文件句柄，重试会失败']
+    ]
+  },
+  {
+    v: '4.2',
+    items: [
+      ['new', '下载位置可设置（自定义路径 / 系统下载文件夹 / 桌面三级回退）'],
+      ['new', '「关闭即退出」选项，勾上后点 × 直接退出而不是最小化到托盘'],
+      ['imp', '删掉侧栏和关于页里的技术文案'],
+      ['fix', 'Esc 关不掉设置弹窗'],
+      ['fix', '自定义下载路径无效时下载直接失败']
+    ]
+  },
+  {
+    v: '4.1.2',
+    items: [
+      ['imp', '更新源只填网址就行，自动补 /latest.json']
+    ]
+  },
+  {
+    v: '4.1.1',
+    items: [
+      ['new', '「关于」里加了开源地址按钮']
+    ]
+  },
+  {
+    v: '4.1',
+    items: [
+      ['new', '增量更新：只下载几百 KB 的核心包，不再每次拉 143 MB'],
+      ['fix', '弹窗被账号页面盖住']
+    ]
+  },
+  {
+    v: '4.0',
+    items: [
+      ['new', '自动更新：侧栏版本徽标、检查更新、下载进度、重启替换']
+    ]
+  }
+];
+
+(function initChangelog() {
+  const mask = document.getElementById('logMask');
+  if (!mask) return;
+  const body = document.getElementById('logBody');
+  const closeBtn = document.getElementById('logClose');
+  const TAG = { new: ['新增', 'new'], imp: ['优化', 'imp'], fix: ['修复', 'fix'] };
+
+  function render() {
+    body.innerHTML = CHANGELOG.map((sec) => {
+      const rows = sec.items.map(([kind, text]) => {
+        const [label, cls] = TAG[kind] || ['', ''];
+        return '<div class="log-item"><span class="log-tag ' + cls + '">' + label + '</span><span>' + text + '</span></div>';
+      }).join('');
+      return '<div class="log-sec"><p class="log-ver-title">v' + sec.v + '</p>' + rows + '</div>';
+    }).join('');
+  }
+
+  function open() {
+    render();
+    mask.hidden = false;
+    // 内容刚插进 DOM，浏览器还没算完布局，这时设 scrollTop 会被忽略，
+    // 放到下一帧再滚到顶部才生效
+    requestAnimationFrame(() => { body.scrollTop = 0; });
+    mask.focus();
+    try { api.uiModal(true); } catch (e) {}
+  }
+
+  function close() {
+    mask.hidden = true;
+    try { api.uiModal(false); } catch (e) {}
+  }
+
+  closeBtn.addEventListener('click', close);
+  if (api.onMenuChangelog) api.onMenuChangelog(open);
+  window.__openChangelog = open;
+})();
+
+// 手动回收入口（调试用，也可以在控制台调 window.__reclaim()）
+window.__reclaim = async () => {
+  try {
+    const r = await api.appReclaim();
+    toast('已清理 ' + ((r && r.sessions) || 0) + ' 个账号的缓存');
+    return r;
+  } catch (e) { return { ok: false, error: e.message }; }
+};
+
+// 主进程推来的 toast（刷新页面/刷新账号完成等）
+if (api.onToast) {
+  api.onToast((msg) => { try { toast(String(msg || '')); } catch (e) {} });
+}
+
+// 主进程侧删了账号（右键菜单删除）后，主动刷一次侧栏
+if (api.onAccountsChanged) {
+  api.onAccountsChanged(() => { try { refresh(); } catch (e) {} });
+}
+
 window.addEventListener('keydown', (e) => {
   if (updMask.hidden || !setMask.hidden) return;
   if (e.key === 'Enter' && !updAction.disabled) { e.preventDefault(); updAction.click(); }
@@ -637,3 +817,426 @@ window.api.onMenuCheckUpdate(() => openUpdateModal());
 })();
 
 refresh();
+
+// ============ 批量发送（同一段话发到多个账号）============
+// 说明：豆包输入框是 ProseMirror，靠焦点判断是否处理 paste。
+// 后台视图注入会被吞掉，所以主进程是一个接一个切到前台再注入的，
+// 界面上会看到账号轮流切换，这是正常的。
+(function initBroadcast() {
+  const mask = document.getElementById('bcMask');
+  if (!mask) return;
+  const listEl = document.getElementById('bcList');
+  const textEl = document.getElementById('bcText');
+  const gapEl = document.getElementById('bcGap');
+  const startBtn = document.getElementById('bcStart');
+  const stopBtn = document.getElementById('bcStop');
+  const closeBtn = document.getElementById('bcClose');
+  const warnEl = document.getElementById('bcWarn');
+  const progEl = document.getElementById('bcProg');
+  let running = false;
+  const MAX_IMGS = 10;   // 豆包一次最多支持 10 张图
+  let pickedImages = [];
+  let pickedThumbs = [];
+  let dragFrom = null;
+
+  const esc = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+
+  async function open() {
+    if (running) return;
+    warnEl.hidden = true;
+    progEl.hidden = true;
+    progEl.innerHTML = '';
+    pickedImages = [];
+    pickedThumbs = [];
+    renderImgs();
+    switchTab('send');
+    startBtn.disabled = false;
+    startBtn.textContent = '开始发送';
+    stopBtn.hidden = true;
+    stopBtn.disabled = false;
+    try {
+      const accounts = await api.accountsList();
+      const usable = (accounts || []).filter((a) => !a.pending);
+      listEl.innerHTML = usable.length
+        ? usable.map((a) => '<label class="bc-item"><input type="checkbox" value="' + esc(a.id) + '"><span>' + esc(a.label) + '</span></label>').join('')
+        : '<div style="font-size:12px;opacity:.6;padding:4px">没有已登录的账号</div>';
+    } catch (e) {
+      listEl.innerHTML = '<div style="font-size:12px;color:#d33;padding:4px">读取账号失败</div>';
+    }
+    mask.hidden = false;
+    mask.focus();
+    try { api.uiModal(true); } catch (e) {}
+  }
+
+  function close() {
+    if (running) return;   // 跑的时候不让关，避免误操作
+    mask.hidden = true;
+    try { api.uiModal(false); } catch (e) {}
+  }
+
+  const pickBtn = document.getElementById('bcPickImgs');
+  const imgsEl = document.getElementById('bcImgs');
+
+  const baseName = (p) => String(p).split(/[\\/]/).pop();
+
+  function renderImgs() {
+    if (!imgsEl) return;
+    if (!pickedImages.length) {
+      imgsEl.innerHTML = '<span class="bc-imgs-empty">未选图片</span>';
+      return;
+    }
+    imgsEl.innerHTML = pickedImages
+      .map((p, i) => {
+        const t = pickedThumbs[i] || '';
+        const inner = t
+          ? '<img src="' + t + '" alt="">'
+          : '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:20px;opacity:.35">?</div>';
+        return '<div class="bc-img" draggable="true" data-idx="' + i + '" title="' + esc(baseName(p)) + '">'
+          + inner
+          + '<span class="bc-img-no">图' + (i + 1) + '</span>'
+          + '<span class="bc-img-del" data-del="' + i + '" title="移除">×</span>'
+          + '</div>';
+      })
+      .join('');
+  }
+
+  // 拖动排序：只在 drop 时才重排数组，拖拽过程中不动 DOM
+  // （中途重建 DOM 会把正在拖的元素销毁，drag 直接中断）
+  if (imgsEl) {
+    imgsEl.addEventListener('dragstart', (e) => {
+      const el = e.target.closest('.bc-img');
+      if (!el || running) { e.preventDefault(); return; }
+      dragFrom = Number(el.dataset.idx);
+      el.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', String(dragFrom)); } catch (err) {}
+    });
+    imgsEl.addEventListener('dragend', (e) => {
+      const el = e.target.closest('.bc-img');
+      if (el) el.classList.remove('dragging');
+      dragFrom = null;
+    });
+    imgsEl.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      try { e.dataTransfer.dropEffect = 'move'; } catch (err) {}
+    });
+    imgsEl.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const el = e.target.closest('.bc-img');
+      if (!el || dragFrom === null) return;
+      const to = Number(el.dataset.idx);
+      if (Number.isNaN(to) || to === dragFrom) { dragFrom = null; return; }
+      const movedP = pickedImages.splice(dragFrom, 1)[0];
+      pickedImages.splice(to, 0, movedP);
+      const movedT = pickedThumbs.splice(dragFrom, 1)[0];
+      pickedThumbs.splice(to, 0, movedT === undefined ? '' : movedT);
+      dragFrom = null;
+      renderImgs();
+    });
+    imgsEl.addEventListener('click', (e) => {
+      const d = e.target.closest('[data-del]');
+      if (!d || running) return;
+      const i = Number(d.dataset.del);
+      pickedImages.splice(i, 1);
+      pickedThumbs.splice(i, 1);
+      renderImgs();
+    });
+  }
+
+  if (pickBtn) {
+    pickBtn.addEventListener('click', async () => {
+      if (running) return;
+      try {
+        const r = await api.broadcastPickImages();
+        if (r && r.ok && r.paths) {
+          let paths = r.paths.slice();
+          let thumbs = (r.thumbs || []).slice();
+          if (paths.length > MAX_IMGS) {
+            paths = paths.slice(0, MAX_IMGS);
+            thumbs = thumbs.slice(0, MAX_IMGS);
+            warnEl.textContent = '豆包一次只能上传 10 张图片，多余的已忽略';
+            warnEl.hidden = false;
+          } else {
+            warnEl.hidden = true;
+          }
+          pickedImages = paths;
+          pickedThumbs = thumbs;
+          renderImgs();
+        }
+      } catch (e) {
+        warnEl.textContent = '选图失败: ' + e.message;
+        warnEl.hidden = false;
+      }
+    });
+  }
+
+  // ---------- 页签 + 视频参数 ----------
+  const RATIOS = ['自动', '3:4', '4:3', '9:16', '16:9', '1:1', '21:9'];
+  const RESOS = ['720p', '1080p'];
+  let curTab = 'send';
+  let curRatio = '9:16';
+  let curReso = '720p';
+
+  const sendOpts = document.getElementById('bcSendOpts');
+  const videoOpts = document.getElementById('bcVideoOpts');
+  const ratiosEl = document.getElementById('bcRatios');
+  const resosEl = document.getElementById('bcResos');
+  const durEl = document.getElementById('bcDur');
+  const durValEl = document.getElementById('bcDurVal');
+  const previewEl = document.getElementById('bcPreview');
+  const textLabelEl = document.getElementById('bcTextLabel');
+  const quickVideoBtn = document.getElementById('bcQuickVideo');
+
+  function renderRatios() {
+    if (!ratiosEl) return;
+    ratiosEl.innerHTML = RATIOS.map(
+      (r) => '<div class="bc-ratio' + (r === curRatio ? ' on' : '') + '" data-r="' + r + '">' + r + '</div>',
+    ).join('');
+  }
+
+  function renderResos() {
+    if (!resosEl) return;
+    resosEl.innerHTML = RESOS.map(
+      (r) => '<div class="bc-reso' + (r === curReso ? ' on' : '') + '" data-r="' + r + '">' + r + '</div>',
+    ).join('');
+  }
+
+  // 结尾那串：比例，秒数，清晰度（都用当前选择的值）
+  function videoSuffix() {
+    const d = durEl ? Number(durEl.value) || 15 : 15;
+    return curRatio + '，' + d + 's，' + curReso;
+  }
+
+  function updatePreview() {
+    if (!previewEl) return;
+    const pvBody = document.getElementById('bcPvBody');
+    const pvTail = document.getElementById('bcPvTail');
+    const raw = (textEl.value || '').trim();
+    if (pvBody) pvBody.textContent = raw || '（这里是你输入的提示词）';
+    if (pvTail) pvTail.textContent = videoSuffix();
+  }
+
+  function switchTab(t) {
+    curTab = t;
+    document.querySelectorAll('.bc-tab').forEach((b) => {
+      b.classList.toggle('on', b.dataset.tab === t);
+    });
+    if (sendOpts) sendOpts.hidden = t !== 'send';
+    if (videoOpts) videoOpts.hidden = t !== 'video';
+    if (quickVideoBtn) quickVideoBtn.hidden = t !== 'video';   // 这个按钮只在视频页
+    if (textLabelEl) textLabelEl.textContent = t === 'video' ? '视频提示词' : '发送内容';
+    if (t === 'video') updatePreview();
+  }
+
+  document.querySelectorAll('.bc-tab').forEach((b) => {
+    b.addEventListener('click', () => { if (!running) switchTab(b.dataset.tab); });
+  });
+  if (ratiosEl) {
+    ratiosEl.addEventListener('click', (e) => {
+      const d = e.target.closest('[data-r]');
+      if (!d) return;
+      curRatio = d.dataset.r;
+      renderRatios();
+      updatePreview();
+    });
+  }
+  if (resosEl) {
+    resosEl.addEventListener('click', (e) => {
+      const d = e.target.closest('[data-r]');
+      if (!d) return;
+      curReso = d.dataset.r;
+      renderResos();
+      updatePreview();
+    });
+  }
+  if (durEl) {
+    durEl.addEventListener('input', () => {
+      if (durValEl) durValEl.textContent = durEl.value + 's';
+      updatePreview();
+    });
+  }
+  if (textEl) {
+    textEl.addEventListener('input', () => { if (curTab === 'video') updatePreview(); });
+  }
+  // 拖进来的图片（preload 拿到真实路径后 postMessage 过来）
+  async function addDroppedFiles(paths) {
+    const imgs = (paths || []).filter((p) => /\.(png|jpe?g|webp|gif|bmp)$/i.test(p));
+    if (!imgs.length) {
+      warnEl.textContent = '拖进来的不是图片文件';
+      warnEl.hidden = false;
+      return;
+    }
+    warnEl.hidden = true;
+    let r = null;
+    try {
+      r = await api.broadcastThumbnails(imgs);
+    } catch (e) {
+      r = null;
+    }
+    const list = (r && r.ok && r.paths) ? r.paths : imgs;
+    const thumbs = (r && r.thumbs) || [];
+    let skipped = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (pickedImages.indexOf(list[i]) !== -1) continue;   // 已经在列表里的不重复加
+      if (pickedImages.length >= MAX_IMGS) { skipped++; continue; }
+      pickedImages.push(list[i]);
+      pickedThumbs.push(thumbs[i] || '');
+    }
+    if (skipped > 0) {
+      warnEl.textContent = '豆包一次只能上传 10 张图片，多余的 ' + skipped + ' 张已忽略';
+      warnEl.hidden = false;
+    }
+    renderImgs();
+  }
+
+  window.addEventListener('message', (ev) => {
+    let d = ev && ev.data;
+    if (!d) return;
+    try { if (typeof d === 'string') d = JSON.parse(d); } catch (e) { return; }
+    if (d && d.__bcDropFiles) addDroppedFiles(d.__bcDropFiles);
+  });
+
+  renderRatios();
+  renderResos();
+
+  // 检测账号：新建对话 + 发「你好豆包」，用来暴露"是否要输验证码"
+  const detectBtn = document.getElementById('bcDetect');
+  if (detectBtn) {
+    detectBtn.addEventListener('click', async () => {
+      if (running) return;
+      const ids = [...listEl.querySelectorAll('input:checked')].map((i) => i.value);
+      if (!ids.length) { warnEl.textContent = '请至少选一个账号'; warnEl.hidden = false; return; }
+      warnEl.hidden = true;
+      const gapSec = Math.max(2, Math.min(60, Number(gapEl.value) || 4));
+      running = true;
+      startBtn.disabled = true;
+      detectBtn.disabled = true;
+      stopBtn.hidden = false;
+      stopBtn.disabled = false;
+      progEl.hidden = false;
+      progEl.innerHTML = '';
+      let r = null;
+      try {
+        r = await api.accountsDetect(ids, gapSec * 1000);
+      } catch (e) {
+        r = { ok: false, error: e.message };
+      }
+      running = false;
+      startBtn.disabled = false;
+      detectBtn.disabled = false;
+      stopBtn.hidden = true;
+      if (!r || !r.ok) {
+        warnEl.textContent = (r && r.error) || '检测失败';
+        warnEl.hidden = false;
+      }
+    });
+  }
+
+  startBtn.addEventListener('click', async () => {
+    if (running) return;
+    const ids = [...listEl.querySelectorAll('input:checked')].map((i) => i.value);
+    const rawText = textEl.value.trim();
+    // 视频页：开头固定「生成视频：」，结尾按当前选择拼「比例，秒数，清晰度」
+    const text = curTab === 'video'
+      ? ('生成视频：' + rawText + '\n' + videoSuffix())
+      : rawText;
+    if (!ids.length) { warnEl.textContent = '请至少选一个账号'; warnEl.hidden = false; return; }
+    if (!rawText && !pickedImages.length) { warnEl.textContent = '内容和图片都是空的'; warnEl.hidden = false; return; }
+    warnEl.hidden = true;
+
+    const gapSec = Math.max(3, Math.min(60, Number(gapEl.value) || 6));
+    gapEl.value = gapSec;
+
+    running = true;
+    startBtn.disabled = true;
+    stopBtn.hidden = false;
+    stopBtn.disabled = false;
+    progEl.hidden = false;
+    progEl.innerHTML = '';
+
+    let r = null;
+    try {
+      r = await api.accountsBroadcast(ids, text, gapSec * 1000, pickedImages.slice());
+    } catch (e) {
+      r = { ok: false, error: e.message };
+    }
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.hidden = true;
+    if (!r || !r.ok) {
+      warnEl.textContent = (r && r.error) || '发送失败';
+      warnEl.hidden = false;
+    }
+  });
+
+  stopBtn.addEventListener('click', async () => {
+    stopBtn.disabled = true;
+    try { await api.accountsBroadcastAbort(); } catch (e) {}
+  });
+  // 「确定生成视频」是回复豆包的确认，发纯文本，不拼比例/时长，也不带图
+  if (quickVideoBtn) {
+    quickVideoBtn.addEventListener('click', async () => {
+      if (running) return;
+      const ids = [...listEl.querySelectorAll('input:checked')].map((i) => i.value);
+      if (!ids.length) { warnEl.textContent = '请至少选一个账号'; warnEl.hidden = false; return; }
+      warnEl.hidden = true;
+      const gapSec = Math.max(3, Math.min(60, Number(gapEl.value) || 6));
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.hidden = false;
+      stopBtn.disabled = false;
+      progEl.hidden = false;
+      progEl.innerHTML = '';
+      let r = null;
+      try {
+        r = await api.accountsBroadcast(ids, '确定生成视频', gapSec * 1000, []);
+      } catch (e) {
+        r = { ok: false, error: e.message };
+      }
+      running = false;
+      startBtn.disabled = false;
+      stopBtn.hidden = true;
+      if (!r || !r.ok) {
+        warnEl.textContent = (r && r.error) || '发送失败';
+        warnEl.hidden = false;
+      }
+    });
+  }
+  closeBtn.addEventListener('click', close);
+  // 故意不绑遮罩点击：和设置弹窗保持一致，避免手滑点空白处把正在填的内容弄丢
+
+  if (api.onBroadcastProgress) {
+    api.onBroadcastProgress((d) => {
+      if (!d) return;
+      const line = document.createElement('div');
+      if (d.phase === 'switching') {
+        line.className = 'cur';
+        line.textContent = '[' + (d.index + 1) + '/' + d.total + '] ' + d.label + ' — 正在切换…';
+      } else {
+        line.className = d.ok ? 'ok' : 'fail';
+        line.textContent = '[' + (d.index + 1) + '/' + d.total + '] ' + d.label + ' — ' + (d.ok ? '已发送' : '失败：' + d.err);
+      }
+      progEl.appendChild(line);
+      progEl.scrollTop = progEl.scrollHeight;
+    });
+  }
+
+  // 调试入口：不经过系统选图框也能塞图进来（排查排序/样式用）
+  window.__bcDebug = {
+    setImages(paths, thumbs) {
+      pickedImages = (paths || []).slice();
+      pickedThumbs = (thumbs || []).slice();
+      renderImgs();
+      return pickedImages.length;
+    },
+    state() {
+      return { n: pickedImages.length, paths: pickedImages.slice() };
+    }
+  };
+
+  if (api.onMenuBroadcast) api.onMenuBroadcast(open);
+  window.__openBroadcast = open;   // 调试用
+})();
+

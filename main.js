@@ -16,7 +16,7 @@ const { app, BrowserWindow, WebContentsView, ipcMain, Menu, session, shell, Tray
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 // v3.0.12: 打包成便携版后没有 bat 帮忙传参数, 而部分机器的 GPU 进程沙箱会被系统策略拦截
 // (表现为连续报 GPU process isn't usable 然后白屏/闪退)。在这里兜底, 双击 exe 即可启动。
@@ -169,6 +169,22 @@ function getContentBounds() {
     width: Math.max(400, b.width - SIDEBAR_WIDTH),
     height: Math.max(300, b.height)
   };
+}
+
+// 统一的视图挂载/卸载。原来 addChildView + setBounds + setVisible 这三行
+// 散落在 5 个地方，漏写其中任何一行都会让视图隐形或者盖住界面
+// （2026-10-30 踩过：群发后切账号一片空白，就是少了一句 setVisible）。
+// 以后要挂视图，只调 attachView。
+function attachView(view) {
+  if (!view || !mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.contentView.addChildView(view); } catch (e) {}
+  try { view.setBounds(getContentBounds()); } catch (e) {}
+  try { view.setVisible(!uiModalOpen); } catch (e) {}
+}
+
+function detachView(view) {
+  if (!view || !mainWindow || mainWindow.isDestroyed()) return;
+  try { mainWindow.contentView.removeChildView(view); } catch (e) {}
 }
 
 // v4.1: 弹窗(检查更新/关于等)是主窗口 DOM 层, 而账号页面是 WebContentsView 原生层。
@@ -540,7 +556,7 @@ function createViewForAccount(account) {
 }
 
 // 崩溃/异常后的重建: 保持分区不变, 若是当前激活视图则重新挂载
-function recreateView(accountId) {
+function recreateView(accountId, notify) {
   const acc = loadAccounts().find(a => a.id === accountId);
   if (!acc) return;
   const old = viewPool.get(accountId);
@@ -552,9 +568,12 @@ function recreateView(accountId) {
   }
   const nv = createViewForAccount(acc);
   viewPool.set(accountId, nv);
-  if (wasActive && mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.contentView.addChildView(nv);
-    nv.setBounds(getContentBounds());
+  if (wasActive) attachView(nv);
+  if (notify) {
+    // 等新视图加载完再提示，不然「刷新成功」和实际白屏对不上
+    try {
+      nv.webContents.once('did-finish-load', () => notifyToast('已刷新账号：' + acc.label));
+    } catch (e) {}
   }
   log('视图已重建: ' + accountId);
 }
@@ -572,8 +591,7 @@ function setActiveAccount(id) {
     log('视图池新建: ' + account.label);
   }
   const view = viewPool.get(id);
-  mainWindow.contentView.addChildView(view);
-  view.setBounds(getContentBounds());
+  attachView(view);
   activeAccountId = id;
   // 弹窗正处于打开状态时切号(如 Ctrl+1), 新挂上来的视图同样会盖住弹窗
   if (uiModalOpen) applyViewVisibility();
@@ -1107,7 +1125,22 @@ async function tickGenWatcher() {
 }
 
 function startGenWatcher() {
-  setInterval(tickGenWatcher, 700);
+  startAutoReclaim();   // 内存自动回收也在这里起步
+  // 动态间隔：只有真有账号在生成、或者在等后台长任务时才用 700ms。
+  // 空闲时降到 4 秒 —— tickGenWatcher 会对每个视图做一次 executeJavaScript，
+  // 6 个视图 × 每 700ms ≈ 每秒 8.6 次跨进程调用，什么都不干也在耗 CPU。
+  const tick = () => {
+    const busy = genSince.size > 0 || genTaskWait.size > 0;
+    setTimeout(async () => {
+      try {
+        await tickGenWatcher();
+      } catch (e) {
+        log('生成轮询异常: ' + (e && e.message));
+      }
+      tick();
+    }, busy ? 700 : 4000);
+  };
+  tick();
 }
 
 // ---------- 会员/套餐识别(v3.0.5) ----------
@@ -1204,7 +1237,7 @@ async function deleteAccountDeep(id) {
   // 1. 清监控与视图(释放句柄)
   clearMonitor(id);
   if (viewPool.has(id)) {
-    try { mainWindow.contentView.removeChildView(viewPool.get(id)); } catch (e) {}
+    detachView(viewPool.get(id));
     try { viewPool.get(id).webContents.close(); } catch (e) {}
     viewPool.delete(id);
     if (activeAccountId === id) activeAccountId = null;
@@ -1407,6 +1440,10 @@ function buildAppMenu() {
       })()
     },
     {
+      label: '批量发送(&B)...',
+      click: () => { ShowMain(); pushToRenderer('menu:broadcast'); }
+    },
+    {
       label: '设置(&P)',
       accelerator: 'CmdOrCtrl+,',
       click: () => { ShowMain(); pushToRenderer('menu:settings'); }
@@ -1414,6 +1451,18 @@ function buildAppMenu() {
     {
       label: '帮助(&H)',
       submenu: [
+        {
+          label: '清理缓存（释放内存）',
+          click: async () => {
+            ShowMain();
+            const n = await reclaimMemory('菜单');
+            notifyToast('已清理 ' + n + ' 个账号的缓存');
+          }
+        },
+        {
+          label: '更新日志',
+          click: () => { ShowMain(); pushToRenderer('menu:changelog'); }
+        },
         {
           label: '检查更新',
           accelerator: 'CmdOrCtrl+U',
@@ -1427,7 +1476,7 @@ function buildAppMenu() {
               .showMessageBox(mainWindow, {
                 type: 'info',
                 title: '关于',
-                message: '豆包多开管理器 v' + APP_VERSION,
+                message: '豆包多开管理器 ' + APP_VERSION_LABEL,
                 detail:
                   '数据目录: ' + USER_DIR + '\n\n' +
                   '原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。\n\n' +
@@ -1706,13 +1755,325 @@ ipcMain.handle('accounts:list', () => {
 });
 ipcMain.handle('accounts:add', async () => await startLoginInView());
 ipcMain.handle('accounts:select', (e, id) => { setActiveAccount(id); return true; });
+// ---------- 批量发送（把同一段话发到多个账号）----------
+// ⚠️ 必须逐个切到前台再注入，原因：豆包输入框是 ProseMirror，靠焦点决定是否处理 paste。
+// 后台视图里 executeJavaScript 能跑，但 paste 事件会被吞掉。
+// 实测 5 个视图同时注入，只有当前可见的那个成功（文本 12 字符，其余全是 0）。
+let broadcastState = { running: false, abort: false };
+function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// 逐张注入：每次 executeJavaScript 只带一张图。
+// 原来是把所有图的 base64 内联进一个脚本串，图一多峰值内存直接顶爆
+// （2026-10-29 日志：child-process-gone type=Utility reason=crashed，整个程序重启）。
+function injectOneImage(it) {
+  return `(() => {
+  try {
+    const ed = document.querySelector('[contenteditable="true"]');
+    if (!ed) return { ok: false, err: '找不到输入框（可能没登录）' };
+    const bin = atob(${JSON.stringify(it.b64)});
+    const arr = new Uint8Array(bin.length);
+    for (let k = 0; k < bin.length; k++) arr[k] = bin.charCodeAt(k);
+    const file = new File([arr], ${JSON.stringify(it.name)}, { type: ${JSON.stringify(it.mime)} });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    ed.focus();
+    ed.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, err: e.message };
+  }
+})()`;
+}
+
+function injectText(text) {
+  return `(() => {
+  try {
+    const ed = document.querySelector('[contenteditable="true"]');
+    if (!ed) return { ok: false, err: '找不到输入框' };
+    const dt = new DataTransfer();
+    dt.setData('text/plain', ${JSON.stringify(text)});
+    ed.focus();
+    ed.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, err: e.message };
+  }
+})()`;
+}
+
+// 点发送，然后看输入框是否清空（清空 = 真的发出去了）
+async function clickSendAndVerify(wc) {
+  const r = await wc.executeJavaScript(`(() => {
+    const ed = document.querySelector('[contenteditable="true"]');
+    if (!ed) return { ok: false, err: '找不到输入框' };
+    const area = ed.closest('[class*="rounded-dbx"]') || ed.parentElement;
+    const btns = [...area.querySelectorAll('button')].filter((b) => b.offsetParent !== null && !b.disabled);
+    const sendBtn = btns[btns.length - 1];
+    if (!sendBtn) return { ok: false, err: '找不到发送按钮' };
+    sendBtn.click();
+    return { ok: true };
+  })()`, true);
+  if (!r || !r.ok) return r || { ok: false, err: '点击发送失败' };
+  await sleepMs(1000);
+  const chk = await wc.executeJavaScript(`(() => {
+    const ed = document.querySelector('[contenteditable="true"]');
+    return { len: ed ? (ed.innerText || '').trim().length : -1 };
+  })()`, true);
+  const left = chk ? chk.len : -1;
+  return { ok: left === 0, err: left === 0 ? '' : '点了发送但输入框没清空' };
+}
+
+// 一个账号的完整流程：聚焦 → 逐张图 → 文本 → 等上传 → 发送
+async function runBroadcastOnAccount(view, text, images) {
+  const wc = view.webContents;
+  if (!wc || wc.isDestroyed()) return { ok: false, err: '视图已销毁' };
+
+  const focused = await wc.executeJavaScript(`(() => {
+    const ed = document.querySelector('[contenteditable="true"]');
+    if (!ed) return false;
+    ed.focus();
+    const s2 = window.getSelection();
+    const rg = document.createRange();
+    rg.selectNodeContents(ed);
+    rg.collapse(false);
+    s2.removeAllRanges();
+    s2.addRange(rg);
+    return true;
+  })()`, true);
+  if (!focused) return { ok: false, err: '找不到输入框（可能没登录）' };
+
+  for (let i = 0; i < images.length; i++) {
+    const r = await wc.executeJavaScript(injectOneImage(images[i]), true);
+    if (!r || !r.ok) {
+      return { ok: false, err: '第 ' + (i + 1) + ' 张图失败: ' + ((r && r.err) || '') };
+    }
+    await sleepMs(900);   // 等这张传上去再粘下一张，顺序才稳
+  }
+
+  if (text) {
+    const r = await wc.executeJavaScript(injectText(text), true);
+    if (!r || !r.ok) return { ok: false, err: '文本注入失败: ' + ((r && r.err) || '') };
+    await sleepMs(700);
+  }
+
+  // 图片上传是异步的，多等一会儿再点发送
+  await sleepMs(images.length ? 1800 : 300);
+
+  const sent = await clickSendAndVerify(wc);
+  return { ok: sent.ok, err: sent.err || '', imgs: images.length };
+}
+
+// 给一批图片路径生成缩略图（拖拽进来的文件走这里，不弹系统对话框）
+ipcMain.handle('broadcast:thumbnails', async (e, paths) => {
+  const list = Array.isArray(paths) ? paths.slice(0, 50) : [];
+  const thumbs = list.map((fp) => {
+    try {
+      const im = nativeImage.createFromPath(fp);
+      if (im.isEmpty()) return '';
+      return im.resize({ width: 96, height: 96, quality: 'good' }).toDataURL();
+    } catch (err) {
+      return '';
+    }
+  });
+  return { ok: true, paths: list, thumbs };
+});
+
+ipcMain.handle('broadcast:pickImages', async () => {
+  try {
+    const r = await dialog.showOpenDialog(mainWindow, {
+      title: '选择要发送的图片（按下面的顺序发给豆包）',
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'] }],
+      properties: ['openFile', 'multiSelections']
+    });
+    if (r.canceled || !r.filePaths.length) return { ok: false, canceled: true };
+    // 顺手做个 96px 缩略图给界面预览用（主窗口是 file:// 页面，
+    // 直接 <img src=file://...> 受 webSecurity 限制，转 dataURL 最省事）
+    const thumbs = r.filePaths.map((fp) => {
+      try {
+        const im = nativeImage.createFromPath(fp);
+        if (im.isEmpty()) return '';
+        return im.resize({ width: 96, height: 96, quality: 'good' }).toDataURL();
+      } catch (e) {
+        return '';
+      }
+    });
+    return { ok: true, paths: r.filePaths, names: r.filePaths.map((x) => path.basename(x)), thumbs };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('accounts:broadcast', async (e, payload) => {
+  if (broadcastState.running) return { ok: false, error: '已有群发任务在跑' };
+  const ids = Array.isArray(payload && payload.ids) ? payload.ids : [];
+  const text = String((payload && payload.text) || '').trim();
+  const gap = Math.max(3000, Number((payload && payload.gap) || 6000));
+  const imgPaths = Array.isArray(payload && payload.images) ? payload.images : [];
+  if (!ids.length) return { ok: false, error: '没选账号' };
+  if (!text && !imgPaths.length) return { ok: false, error: '内容和图片都是空的' };
+
+  // 图片读成 base64（按选择顺序），一次读好给所有账号复用
+  const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp' };
+  const images = [];
+  let totalBytes = 0;
+  for (const ip of imgPaths) {
+    try {
+      let buf = null;
+      let mime = 'image/jpeg';
+      // 压缩后再传：原图 base64 塞进 executeJavaScript 会把 Utility 进程撑爆
+      // （2026-10-29 实测：群发大图后 child-process-gone type=Utility reason=crashed，
+      //  整个程序跟着重启）。长边压到 1600、转 JPEG 85，体积通常降到原来的 1/5 以下。
+      try {
+        const im = nativeImage.createFromPath(ip);
+        if (!im.isEmpty()) {
+          const sz = im.getSize();
+          const maxEdge = 2560;
+          const scale = Math.min(1, maxEdge / Math.max(sz.width || 1, sz.height || 1));
+          const out = scale < 1
+            ? im.resize({ width: Math.round(sz.width * scale), height: Math.round(sz.height * scale), quality: 'good' })
+            : im;
+          buf = out.toJPEG(92);
+        }
+      } catch (e) {}
+      if (!buf || !buf.length) {
+        buf = fs.readFileSync(ip);
+        mime = MIME[String(path.extname(ip).slice(1)).toLowerCase()] || 'image/png';
+      }
+      totalBytes += buf.length;
+      images.push({ name: path.basename(ip), mime, b64: buf.toString('base64') });
+    } catch (err) {
+      return { ok: false, error: '读图失败: ' + path.basename(ip) };
+    }
+  }
+  if (totalBytes > 24 * 1024 * 1024) {
+    return { ok: false, error: '图片总大小超过 24MB（压缩后），请少选几张' };
+  }
+  log('群发准备: ' + ids.length + ' 个账号, ' + images.length + ' 张图');
+
+  const prev = activeAccountId;
+  broadcastState.running = true;
+  broadcastState.abort = false;
+  const results = [];
+  log('群发开始: ' + ids.length + ' 个账号, 间隔 ' + gap + 'ms');
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const acc = loadAccounts().find((a) => a.id === id);
+      const label = acc ? acc.label : id;
+      if (broadcastState.abort) {
+        results.push({ id, label, ok: false, err: '已取消' });
+        continue;
+      }
+      pushToRenderer('broadcast:progress', { index: i, total: ids.length, id, label, phase: 'switching' });
+      let r = { ok: false, err: '未知' };
+      try {
+        setActiveAccount(id);
+        await sleepMs(1000);   // 等视图挂上来、页面渲染稳定，太快 paste 会落空
+        const view = viewPool.get(id);
+        if (!view) throw new Error('视图不存在');
+        r = await runBroadcastOnAccount(view, text, images);
+      } catch (err) {
+        r = { ok: false, err: err.message || String(err) };
+      }
+      results.push({ id, label, ok: !!(r && r.ok), err: (r && r.err) || '' });
+      log('群发 ' + label + ': ' + ((r && r.ok) ? '成功' : '失败 ' + ((r && r.err) || '')));
+      pushToRenderer('broadcast:progress', {
+        index: i, total: ids.length, id, label, phase: 'done',
+        ok: !!(r && r.ok), err: (r && r.err) || ''
+      });
+      if (i < ids.length - 1 && !broadcastState.abort) await sleepMs(gap);
+    }
+  } finally {
+    broadcastState.running = false;
+    if (prev) {
+      try { setActiveAccount(prev); } catch (err) {}
+    }
+    // 兜底：群发中途反复切视图，个别视图可能留在"不可见"或空页面状态。
+    // 这里统一把当前视图恢复成可见，并检查页面是否还活着。
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        const cv = getActiveView();
+        if (cv) {
+          cv.setBounds(getContentBounds());
+          try { cv.setVisible(!uiModalOpen); } catch (err) {}
+          const wc2 = cv.webContents;
+          if (wc2 && !wc2.isDestroyed() && !wc2.isLoading() && wc2.getURL() === '') {
+            wc2.loadURL(DOUBAO_URL);
+          }
+        }
+      }
+    } catch (err) { log('群发收尾恢复视图失败: ' + err.message); }
+    log('群发结束');
+  }
+  return { ok: true, results };
+});
+
+// 检测账号：新建一个对话，发一句「你好豆包」。
+// 长时间不用的账号再发消息时，豆包可能要求输验证码 —— 走一遍发消息流程就能暴露出来。
+ipcMain.handle('accounts:detect', async (e, payload) => {
+  if (broadcastState.running) return { ok: false, error: '已有任务在跑' };
+  const ids = Array.isArray(payload && payload.ids) ? payload.ids : [];
+  const gap = Math.max(2000, Number((payload && payload.gap) || 4000));
+  if (!ids.length) return { ok: false, error: '没选账号' };
+
+  const prev = activeAccountId;
+  broadcastState.running = true;
+  broadcastState.abort = false;
+  const results = [];
+  log('检测账号开始: ' + ids.length + ' 个');
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const acc = loadAccounts().find((a) => a.id === id);
+      const label = acc ? acc.label : id;
+      if (broadcastState.abort) {
+        results.push({ id, label, ok: false, err: '已取消' });
+        continue;
+      }
+      pushToRenderer('broadcast:progress', { index: i, total: ids.length, id, label, phase: 'switching' });
+      let r = { ok: false, err: '未知' };
+      try {
+        setActiveAccount(id);
+        await sleepMs(700);
+        const view = viewPool.get(id);
+        if (!view) throw new Error('视图不存在');
+        const wc = view.webContents;
+        if (!wc || wc.isDestroyed()) throw new Error('页面已关闭');
+
+        await wc.loadURL(DOUBAO_URL);   // 新建对话 = 回首页
+        await sleepMs(2500);            // 等输入框渲染出来
+
+        r = await runBroadcastOnAccount(view, '你好豆包', []);
+      } catch (err) {
+        r = { ok: false, err: err.message || String(err) };
+      }
+      results.push({ id, label, ok: !!(r && r.ok), err: (r && r.err) || '' });
+      pushToRenderer('broadcast:progress', {
+        index: i, total: ids.length, id, label, phase: 'done',
+        ok: !!(r && r.ok), err: (r && r.err) || ''
+      });
+      if (i < ids.length - 1 && !broadcastState.abort) await sleepMs(gap);
+    }
+  } finally {
+    broadcastState.running = false;
+    if (prev) { try { setActiveAccount(prev); } catch (err) {} }
+    log('检测账号结束');
+  }
+  return { ok: true, results };
+});
+
+ipcMain.handle('accounts:broadcastAbort', () => {
+  broadcastState.abort = true;
+  return true;
+});
+
 ipcMain.handle('accounts:rename', (e, payload) => {
   const accounts = loadAccounts();
   const acc = accounts.find(a => a.id === payload.id);
   if (acc) { acc.label = String(payload.label).trim().slice(0, 20); saveAccounts(accounts); }
   return accounts;
 });
-ipcMain.handle('accounts:delete', async (e, id) => {
+async function deleteAccountFull(id) {
   const accounts = loadAccounts().filter(a => a.id !== id);
   saveAccounts(accounts);
   badges.delete(id);
@@ -1729,6 +2090,128 @@ ipcMain.handle('accounts:delete', async (e, id) => {
   await deleteAccountDeep(id);
   rebuildTrayMenu();
   return accounts;
+}
+
+ipcMain.handle('accounts:delete', async (e, id) => deleteAccountFull(id));
+
+// ---------- 账号右键菜单：刷新页面 / 刷新账号 / 删除 ----------
+// 左下角 toast（渲染进程统一渲染）
+function notifyToast(text) {
+  try { pushToRenderer('toast', text); } catch (e) {}
+}
+
+function reloadAccountPage(id) {
+  const v = viewPool.get(id);
+  const acc = loadAccounts().find((a) => a.id === id);
+  const label = acc ? acc.label : id;
+  if (!v) { notifyToast('刷新失败：视图不存在'); return; }
+  const wc = v.webContents;
+  if (!wc || wc.isDestroyed()) { notifyToast('刷新失败：页面已关闭'); return; }
+
+  let done = false;
+  const onLoaded = () => {
+    if (done) return;
+    done = true;
+    notifyToast('已刷新页面：' + label);
+    log('刷新页面完成: ' + label);
+  };
+  try { wc.once('did-finish-load', onLoaded); } catch (e) {}
+  try {
+    wc.reload();
+  } catch (e) {
+    notifyToast('刷新页面失败: ' + e.message);
+    return;
+  }
+  // 15 秒还没加载完就不再提示（页面可能卡在加载中）
+  setTimeout(() => {
+    try { wc.removeListener('did-finish-load', onLoaded); } catch (e) {}
+  }, 15000);
+}
+
+async function confirmDeleteAccount(id, label) {
+  const r = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    buttons: ['取消', '删除'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: '删除账号',
+    message: '删除账号「' + label + '」？',
+    detail: '该账号的登录态与页面数据会一并清理，无法恢复。'
+  });
+  if (r.response !== 1) return;
+  await deleteAccountFull(id);
+  log('已删除账号: ' + label);
+  pushToRenderer('accounts:changed', loadAccounts());
+}
+
+// ---------- 内存回收 ----------
+// 清的是 HTTP 缓存（图片/JS 那部分），不动 cookie 和 localStorage，登录态不受影响。
+// 代价是清完之后豆包会重新下载一些资源，所以只在内存真高的时候做。
+async function reclaimMemory(reason) {
+  let n = 0;
+  for (const [id, v] of viewPool) {
+    try {
+      const wc = v.webContents;
+      if (!wc || wc.isDestroyed()) continue;
+      await wc.session.clearCache();
+      n++;
+    } catch (e) {}
+  }
+  log('内存回收(' + reason + ')：清理 ' + n + ' 个账号的会话缓存');
+  return n;
+}
+
+ipcMain.handle('app:reclaim', async () => {
+  const sessions = await reclaimMemory('手动');
+  return { ok: true, sessions };
+});
+
+// 自动回收：每 5 分钟看一次总内存，超过 3GB 就清一轮
+function startAutoReclaim() {
+  setInterval(async () => {
+    try {
+      const metrics = app.getAppMetrics();
+      let totalMB = 0;
+      for (const m of metrics) {
+        const kb = (m.memory && m.memory.workingSetSize) || 0;
+        totalMB += kb / 1024;
+      }
+      if (totalMB > 3000) {
+        log('总内存 ' + Math.round(totalMB) + ' MB 超过 3000，自动回收');
+        await reclaimMemory('自动');
+      }
+    } catch (e) {
+      log('自动回收检查失败: ' + e.message);
+    }
+  }, 5 * 60 * 1000);
+}
+
+ipcMain.handle('accounts:contextMenu', (e, id) => {
+  const acc = loadAccounts().find((a) => a.id === id);
+  if (!acc) return false;
+  const menu = Menu.buildFromTemplate([
+    {
+      label: '刷新页面',
+      click: () => reloadAccountPage(id)
+    },
+    {
+      label: '刷新账号',
+      click: () => {
+        // 彻底重建这个账号的视图（连 WebContents 一起换新），
+        // 页面本身卡死 / 白屏 / 渲染进程出问题时用这个，不用重启整个软件
+        try { recreateView(id, true); log('刷新账号: ' + acc.label); } catch (err) { log('刷新账号失败: ' + err.message); }
+      }
+    },
+    { type: 'separator' },
+    {
+      label: '删除账号…',
+      // 二次确认交给渲染进程做（原生 dialog 的按钮改不了颜色/宽度）
+      click: () => pushToRenderer('accounts:confirmDelete', { id, label: acc.label })
+    }
+  ]);
+  menu.popup({ window: mainWindow });
+  return true;
 });
 ipcMain.handle('accounts:detectName', async (e, id) => {
   const list = loadAccounts();
@@ -1828,6 +2311,7 @@ const APP_VERSION = (() => {
   try { return String(require(path.join(APP_DIR, 'package.json')).version || '0.0.0'); }
   catch (e) { return '0.0.0'; }
 })();
+const APP_VERSION_LABEL = '开发版v4.2.4';
 const UPDATE_DIR = path.join(USER_DIR, '_update');
 // 兜底更新源: 仓库的 Releases(latest)。未在设置里填自定义地址时用它。
 const GH_REPO = 'jianbingdev/doubao-multi-open';
@@ -1923,11 +2407,17 @@ const UPDATE_SCRIPT = [
   '} catch { Fail ("copy failed: " + $_.Exception.Message) }',
   'try {',
   '  if (-not (Test-Path -LiteralPath $cfg.exe)) { Fail ("exe missing after update: " + $cfg.exe) }',
-  '  if ([string]::IsNullOrWhiteSpace($cfg.launchArgs)) {',
-  '    Start-Process -FilePath $cfg.exe',
-  '  } else {',
-  '    Start-Process -FilePath $cfg.exe -ArgumentList $cfg.launchArgs',
-  '  }',
+  // 关键：不能用 Start-Process 启动新程序。
+  // Start-Process 起出来的进程在有些环境里会挂在当前 PowerShell 的控制台上，
+  // 结果就是"关掉那个 PS 窗口 → 刚起来的程序跟着退出"（用户实测踩到过）。
+  // cmd /c start 走的是 CREATE_NEW_CONSOLE + ShellExecute，新进程和 PS 完全没有父子/控制台关系，
+  // 关 PS 窗口、甚至 PS 整个退掉，都不会影响新程序。
+  '  $argLine = ""',
+  '  try { if (-not [string]::IsNullOrWhiteSpace($cfg.launchArgs)) { $argLine = " " + $cfg.launchArgs } } catch {}',
+  '  $launchCmd = "start \"\" \"" + $cfg.exe + "\"" + $argLine',
+  '  Write-Log ("launch: " + $launchCmd)',
+  '  $p = Start-Process -FilePath "cmd.exe" -ArgumentList ("/c " + $launchCmd) -WindowStyle Hidden -PassThru',
+  '  if ($p) { $null = $p.WaitForExit(3000) }',
   '  Write-Log "relaunched"',
   '} catch { Fail ("relaunch failed: " + $_.Exception.Message) }',
   'Start-Sleep -Seconds 2',
@@ -2229,10 +2719,23 @@ function downloadUpdate() {
 // 进程能拿到 pid、不报错, 但脚本一行都没执行(连日志都不写), 于是既没更新也没重启。
 // 实测改用 cmd 的 start 才能真正拉起独立进程。
 function launchUpdateScript(scriptPath) {
+  // 这个启动方式试过 6 种组合，结论记一下：
+  //
+  //   cmd /c start /min ...    能跑，但 start 会给 PS 新开一个控制台，
+  //                            windowsHide 管不到它 → 每次更新留一个最小化窗口（原来的 bug）
+  //   spawn 裸调 + detached     起不来（powershell.exe 是控制台程序，脱离控制台就失败）
+  //   spawn + -WindowStyle Hidden  同上，起不来
+  //   spawn 不 detached         能跑，但父进程(app.quit())一退 PS 就被带走，
+  //                            解压到一半停了 —— 这更不能要
+  //   cmd /c start /b ...       ✅ 用这个
+  //
+  // /b 和 /min 的关键区别：/b 不新开窗口，PS 共用 cmd 的控制台，
+  // 而 cmd 的窗口被 windowsHide 藏掉了 → PS 完全不可见，
+  // 同时 start 把它挂在独立进程上，Electron 退出后照样跑完。
   const child = spawn('cmd.exe',
-    ['/c', 'start', '/min', '', 'powershell.exe',
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
-    { detached: true, stdio: 'ignore', windowsHide: true });
+    ['/c', 'start', '/b', '', 'powershell.exe',
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+    { stdio: 'ignore', windowsHide: true });
   let launchErr = null;
   child.on('error', (e) => { launchErr = e; });
   child.unref();
@@ -2324,6 +2827,34 @@ async function applyUpdate() {
 
 // 启动时清掉上次更新留下的脚本, 但保留已下载好的 zip
 // (用户可能下载完先没重启, 下次打开直接点"重启并更新"即可, 不用重下)
+// 清理上次更新遗留的 PowerShell 窗口。
+// 旧版本（4.2.3 及以前）的更新脚本用 cmd /c start /min 启动，
+// 脚本跑完后那个最小化窗口不会自己关，会一直挂在桌面上。
+// 只杀命令行里带 apply-update 的进程 —— 用户自己开的 PowerShell 绝不动。
+function cleanupStaleUpdateShell() {
+  try {
+    const cmd = [
+      "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\"",
+      // 匹配要精确：只认真正的脚本文件名 apply-update.ps1。
+      // 原来写 '*apply-update*' 太宽，实测会误命中命令行里碰巧含这个词的进程
+      // （比如某个工具在检查文件路径时把 apply-update.ps1 带进了命令行）。
+      "| Where-Object { $_.CommandLine -like '*apply-update.ps1*' }",
+      "| ForEach-Object { $p = $_.ProcessId; try { Stop-Process -Id $p -Force -ErrorAction Stop; Write-Output $p } catch {} }"
+    ].join(' ');
+    const r = spawnSync('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', cmd],
+      { windowsHide: true, timeout: 8000, encoding: 'utf8' });
+    const killed = String((r && r.stdout) || '').trim();
+    if (killed) {
+      log('清理更新残留窗口: pid ' + killed.replace(/\s+/g, ', '));
+    } else {
+      log('没有更新残留窗口');
+    }
+  } catch (e) {
+    log('清理更新残留失败: ' + e.message);
+  }
+}
+
 function cleanupUpdateDir() {
   try {
     if (!fs.existsSync(UPDATE_DIR)) return;
@@ -2362,7 +2893,7 @@ function restoreUpdateState() {
 
 ipcMain.handle('app:info', () => ({
   version: APP_VERSION,
-  versionLabel: 'v' + APP_VERSION,
+  versionLabel: APP_VERSION_LABEL,
   packaged: app.isPackaged,
   dataDir: USER_DIR,
   updateUrl: prefs.updateUrl || ''
@@ -2398,6 +2929,7 @@ if (!gotLock) {
 app.whenReady().then(() => {
   log('app ready, userData=' + app.getPath('userData'));
   cleanupUpdateDir();
+  cleanupStaleUpdateShell();
   restoreUpdateState();
   sweepPendingCleanups();
   buildAppMenu();

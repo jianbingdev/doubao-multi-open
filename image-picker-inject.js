@@ -170,7 +170,7 @@
     // 超出边界的部分用 clip-path 裁掉，线以内的部分照常显示 ——
     // 不能整块 display:none（用户要求：超过线的部分消失，没超过的还展示出来）。
     let inputTop = Infinity;
-    const ed = document.querySelector('[contenteditable="true"]');
+    const ed = getEditor();   // 用缓存的，不再每次全文档查
     if (ed) {
       try {
         const frame = ed.closest('[class*="rounded-dbx"]') || ed.closest('.guidance-input-surface') || ed;
@@ -229,6 +229,15 @@
         rec.hl.style.display = 'none';
       }
     }
+  }
+
+  // 输入框在页面生命周期内基本不变，没必要每次 syncPositions 都全文档查一遍。
+  // 只在元素断开连接（豆包重建了输入区）时才重查。
+  let cachedEditor = null;
+  function getEditor() {
+    if (cachedEditor && cachedEditor.isConnected) return cachedEditor;
+    cachedEditor = document.querySelector('[contenteditable="true"]');
+    return cachedEditor;
   }
 
   let syncRaf = 0;
@@ -417,7 +426,10 @@
     window.addEventListener('scroll', scheduleSync, { passive: true, capture: true });
     window.addEventListener('resize', scheduleSync, { passive: true });
     // 图片加载完、布局微调时位置会变，低频兜底同步一次
-    setInterval(scheduleSync, 800);
+    // 兜底轮询已去掉（2026-10-31）：滚动/缩放/DOM 变化都有各自的监听，走 rAF 是实时的。
+    // 原来 800ms 那份纯粹是"怕漏"，但 6 个视图 × 每秒 7.5 次，
+    // 每次都要全文档 querySelector + 遍历所有图片做强制布局，越用越卡。
+    // 用户实测去掉后滚动正常。
   }
 
   // 主进程回传结果

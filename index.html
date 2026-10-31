@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
   <title>豆包多开管理器</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -96,11 +96,6 @@
     }
     .badge.pending { background: #fff3cd; color: #8a6d1a; }
     .badge.offline, .badge.loadfail { background: #fdecea; color: #b3261e; }
-    .del {
-      color: #c0392b; font-size: 12px; border: none; background: none;
-      cursor: pointer; visibility: hidden; padding: 2px 6px;
-    }
-    .account-item:hover .del { visibility: visible; }
     .empty-tip { color: #86868b; font-size: 12px; text-align: center; padding: 30px 10px; line-height: 1.8; }
     .sidebar-footer { border-top: 1px solid #eeeef2; padding: 10px 14px 12px; }
     .author-row {
@@ -220,7 +215,103 @@
       color: #b3261e; font-size: 12px; line-height: 1.6;
     }
     .set-warn[hidden] { display: none; }
-  </style>
+  
+  /* 批量发送弹窗 */
+  .bc-list { max-height: 92px; overflow: auto; border: 1px solid var(--line, #e5e5e5); border-radius: 8px; padding: 6px 8px; }
+  .bc-item { display: flex; align-items: center; gap: 8px; padding: 4px 2px; font-size: 13px; cursor: pointer; }
+  .bc-item input { margin: 0; }
+  /* 标题行：左边标题，右边提示 */
+  .bc-imgtitle { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .bc-imghint { font-size: 11px; opacity: .55; white-space: nowrap; }
+  /* 选图按钮撑满整行，主文字 + 次要提示排一行 */
+  .bc-imgrow { display: block; margin-top: 6px; }
+  #bcPickImgs { width: 100%; display: flex; align-items: baseline; justify-content: center; gap: 10px; white-space: nowrap;
+                padding: 10px 16px; font-size: 13px; }
+  .bc-btn-hint { font-size: 11px; opacity: .5; font-weight: 400; white-space: nowrap; }
+  .bc-imgs { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; min-height: 40px; align-items: center; }
+  .bc-imgs-empty { opacity: .5; font-size: 12px; }
+  .bc-img { position: relative; width: 72px; height: 72px; border-radius: 8px; overflow: hidden;
+            cursor: grab; border: 2px solid transparent; background: #f2f2f5; transition: border-color .12s, opacity .12s; }
+  .bc-img:hover { border-color: #c9d8f7; }
+  .bc-img.dragging { opacity: .35; }
+  .bc-img img { width: 100%; height: 100%; object-fit: cover; display: block; pointer-events: none; }
+  .bc-img-no { position: absolute; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.6);
+               color: #fff; font-size: 11px; text-align: center; line-height: 17px; pointer-events: none; }
+  .bc-img-del { position: absolute; right: 2px; top: 2px; width: 16px; height: 16px; line-height: 15px;
+                text-align: center; border-radius: 50%; background: rgba(0,0,0,.55); color: #fff;
+                font-size: 12px; cursor: pointer; opacity: 0; transition: opacity .12s; }
+  .bc-img:hover .bc-img-del { opacity: 1; }
+  .bc-img-hint { margin-top: 4px; font-size: 11px; opacity: .55; }
+  .bc-text { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--line, #e5e5e5); border-radius: 8px; font: inherit; font-size: 13px; resize: vertical; }
+  .bc-row { display: flex; align-items: center; gap: 8px; }
+  .bc-num { width: 72px; padding: 5px 8px; border: 1px solid var(--line, #e5e5e5); border-radius: 6px; font: inherit; font-size: 13px; }
+  .bc-unit { font-size: 12px; opacity: .7; }
+  .bc-risk { color: #c8642a !important; }
+  .bc-prog { margin-top: 12px; font-size: 12px; line-height: 1.7; max-height: 140px; overflow: auto; border-top: 1px dashed var(--line, #e5e5e5); padding-top: 8px; }
+  .bc-prog .ok { color: #17a34a; }
+  .bc-prog .fail { color: #d33; }
+  .bc-prog .cur { opacity: .7; }
+
+  /* 群发弹窗：页签 + 视频参数 */
+  .bc-tabs { display: flex; gap: 4px; margin-bottom: 10px; background: #f2f2f5; border-radius: 9px; padding: 3px; }
+  .bc-tab { flex: 1; padding: 6px 10px; border: 0; background: transparent; border-radius: 7px;
+            font: inherit; font-size: 13px; cursor: pointer; color: #666; transition: background .12s, color .12s; }
+  .bc-tab.on { background: #fff; color: #222; font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .bc-ratios { display: flex; gap: 4px; flex-wrap: nowrap; }
+  .bc-ratio { flex: 1 1 0; min-width: 0; padding: 6px 1px; text-align: center;
+              border: 1px solid #e3e3e8; border-radius: 7px; font-size: 11px; cursor: pointer;
+              background: #fafafa; user-select: none; white-space: nowrap;
+              transition: border-color .12s, background .12s; }
+  .bc-ratio:hover { border-color: #c9d8f7; }
+  .bc-ratio.on { border-color: #4F86F7; background: rgba(79,134,247,.1); color: #3b6fd4; font-weight: 600; }
+  .bc-durline { display: flex; align-items: baseline; justify-content: space-between; margin-top: 12px; }
+  .bc-durline b { font-size: 15px; color: #4F86F7; }
+  .bc-range { width: 100%; margin: 6px 0 2px; accent-color: #4F86F7; cursor: pointer; }
+  .bc-range-ends { display: flex; justify-content: space-between; font-size: 11px; opacity: .5; }
+  .bc-resos { display: flex; gap: 6px; }
+  .bc-reso { flex: 1; padding: 7px 6px; text-align: center; border: 1px solid #e3e3e8; border-radius: 8px;
+             font-size: 12px; cursor: pointer; background: #fafafa; user-select: none;
+             transition: border-color .12s, background .12s; }
+  .bc-reso:hover { border-color: #c9d8f7; }
+  .bc-reso.on { border-color: #4F86F7; background: rgba(79,134,247,.1); color: #3b6fd4; font-weight: 600; }
+  .bc-preview { margin-top: 10px; padding: 8px 10px; background: #f7f8fa; border-radius: 8px;
+                font-size: 11.5px; color: #555; line-height: 1.55;
+                max-height: 78px; display: flex; flex-direction: column; }
+  /* 开头（生成视频：）和结尾（比例/时长/清晰度）固定，只有中间提示词滚动 */
+  .bc-pv-head { flex: 0 0 auto; color: #999; font-size: 11px; }
+  .bc-pv-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; white-space: pre-wrap; word-break: break-word; color: #333; }
+  .bc-pv-tail { flex: 0 0 auto; color: #3b6fd4; font-weight: 600; padding-top: 2px; }
+  /* 弹窗整体限高：提示词很长时不把弹窗顶出屏幕 */
+  /* 加宽到 520：380 太窄，"选择图片…" 和旁边的提示都会折行 */
+  .bc-modal { width: 520px; max-height: 92vh; display: flex; flex-direction: column; }
+  .bc-modal .mbtn { white-space: nowrap; }
+  .bc-modal .modal-body { overflow-y: auto; }
+  .bc-modal .modal-head, .bc-modal .modal-foot { flex: 0 0 auto; }
+
+  /* 删除账号确认框 */
+  .del-modal { max-width: 360px; }
+  .del-title { margin: 0 0 8px; font-size: 14px; font-weight: 600; color: #222; }
+  .del-desc { margin: 0; font-size: 12.5px; color: #888; line-height: 1.65; }
+  .del-desc b { color: #d33; }
+  .del-foot { display: flex; gap: 10px; }
+  .del-cancel { flex: 2; }   /* 取消给两倍宽度，主按钮更好点 */
+  .del-danger { flex: 1; background: #e5484d; border-color: #e5484d; color: #fff; }
+  .del-danger:hover { background: #d13b40; border-color: #d13b40; }
+
+  /* 更新日志 */
+  .log-modal { max-width: 460px; max-height: 82vh; display: flex; flex-direction: column; }
+  .log-body { overflow-y: auto; padding-right: 4px; }
+  .log-ver { margin: 0 0 4px; font-size: 12px; color: #999; font-weight: 400; letter-spacing: .3px; }
+  .log-item { display: flex; gap: 8px; align-items: flex-start; padding: 3px 0; font-size: 12.5px; line-height: 1.6; color: #333; }
+  .log-tag { flex: 0 0 auto; font-size: 10.5px; line-height: 16px; padding: 0 6px; border-radius: 4px; margin-top: 1px; }
+  .log-tag.new { background: rgba(79,134,247,.12); color: #3b6fd4; }
+  .log-tag.imp { background: rgba(23,163,74,.12); color: #138a3e; }
+  .log-tag.fix { background: rgba(229,72,77,.12); color: #c9363b; }
+  .log-sec { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid #f0f0f3; }
+  .log-sec:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+  .log-ver-title { font-size: 13.5px; font-weight: 600; color: #222; margin: 0 0 8px; }
+  .log-ver-title span { font-size: 11.5px; color: #aaa; font-weight: 400; margin-left: 6px; }
+</style>
 </head>
 <body>
   <aside class="sidebar">
@@ -300,8 +391,108 @@
         <button class="mbtn primary" id="setSave">保存</button>
       </div>
     </div>
+  
+  
+</div>
+
+  <!-- 批量发送（同一段话发到多个账号） -->
+  <div class="mask" id="bcMask" hidden tabindex="-1">
+    <div class="modal bc-modal">
+      <div class="modal-head">
+        <span>批量发送</span>
+        <button class="modal-x" id="bcClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+          <div class="bc-tabs">
+            <button type="button" class="bc-tab on" data-tab="send">批量发送</button>
+            <button type="button" class="bc-tab" data-tab="video">生成视频</button>
+          </div>
+          <div class="set-warn" id="bcWarn" hidden></div>
+          <div class="set-label">发送到哪些账号</div>
+          <div id="bcList" class="bc-list"></div>
+          <div class="bc-imgtitle">
+              <span class="set-label" style="margin:0">要一起发送的图片（可选）</span>
+              <span class="bc-imghint">可拖动图片调整顺序 · 最多 10 张</span>
+            </div>
+          <div class="bc-imgrow">
+            <button class="mbtn" id="bcPickImgs">
+              <span>选择图片…</span>
+              <span class="bc-btn-hint">可拖动图片添加</span>
+            </button>
+          </div>
+          <div id="bcImgs" class="bc-imgs"><span class="bc-imgs-empty">未选图片（可以把图片拖进来）</span></div>
+          <div class="set-label" style="margin-top:6px" id="bcTextLabel">发送内容</div>
+          <textarea id="bcText" class="bc-text" rows="3" placeholder="要发送的提示词…"></textarea>
+
+          <div id="bcSendOpts">
+            <div class="set-label" style="margin-top:6px">每两个账号之间间隔</div>
+            <div class="bc-row">
+              <input id="bcGap" class="bc-num" type="number" min="3" max="60" value="6">
+              <span class="bc-unit">秒（建议 ≥5，太快容易触发风控）</span>
+            </div>
+            <p class="set-hint bc-risk">⚠️ 多个账号在短时间内发送相同内容，有被平台判定为机器行为的风险。建议一次只发 2-3 个，间隔拉长。</p>
+            <div class="bc-row" style="margin-top:6px">
+              <button type="button" class="mbtn" id="bcDetect">检测账号</button>
+              <span class="bc-unit">新建对话并发一句「你好豆包」，看会不会要求输验证码</span>
+            </div>
+          </div>
+
+          <div id="bcVideoOpts" hidden>
+            <div class="set-label" style="margin-top:6px">画面比例</div>
+            <div class="bc-ratios" id="bcRatios"></div>
+            <div class="bc-durline">
+              <span class="set-label" style="margin:0">时长</span>
+              <b id="bcDurVal">15s</b>
+            </div>
+            <input type="range" id="bcDur" class="bc-range" min="4" max="30" step="1" value="15">
+            <div class="bc-range-ends"><span>4s</span><span>30s</span></div>
+            <div class="set-label" style="margin-top:6px">清晰度</div>
+            <div class="bc-resos" id="bcResos"></div>
+            <div class="bc-preview" id="bcPreview">
+              <div class="bc-pv-head">生成视频：</div>
+              <div class="bc-pv-body" id="bcPvBody"></div>
+              <div class="bc-pv-tail" id="bcPvTail"></div>
+            </div>
+          </div>
+
+          <div id="bcProg" class="bc-prog" hidden></div>
+        </div>
+        <div class="modal-foot">
+          <button class="mbtn" id="bcQuickVideo" hidden>确定生成视频</button>
+          <button class="mbtn" id="bcStop" hidden>停止</button>
+          <button class="mbtn primary" id="bcStart">开始发送</button>
+        </div>
+    </div>
+  </div>
+  <!-- 删除账号二次确认 -->
+  <div class="mask" id="delMask" hidden tabindex="-1">
+    <div class="modal del-modal">
+      <div class="modal-head">
+        <span>删除账号</span>
+        <button type="button" class="modal-x" id="delClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body">
+        <p class="del-title" id="delTitle">删除账号？</p>
+        <p class="del-desc">该账号的登录态与页面数据会一并清理，<b>无法恢复</b>。</p>
+      </div>
+      <div class="modal-foot del-foot">
+        <button type="button" class="mbtn del-cancel" id="delCancel">取消</button>
+        <button type="button" class="mbtn del-danger" id="delOk">删除</button>
+      </div>
+    </div>
   </div>
 
-  <script src="renderer.js"></script>
+  <!-- 更新日志 -->
+  <div class="mask" id="logMask" hidden tabindex="-1">
+    <div class="modal log-modal">
+      <div class="modal-head">
+        <span>更新日志</span>
+        <button type="button" class="modal-x" id="logClose" title="关闭">×</button>
+      </div>
+      <div class="modal-body log-body" id="logBody"></div>
+    </div>
+  </div>
+
+<script src="renderer.js"></script>
 </body>
 </html>
