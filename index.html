@@ -215,6 +215,30 @@
       color: #b3261e; font-size: 12px; line-height: 1.6;
     }
     .set-warn[hidden] { display: none; }
+    .set-rename {
+      margin: 10px 0 0; padding: 10px 11px 11px; border-radius: 8px;
+      background: #f7f7fa; border: 1px solid #ebebf0;
+    }
+    .set-rename.is-off { opacity: .48; }
+    .set-rename .set-label { margin-bottom: 5px; }
+    .set-select, .set-input {
+      width: 100%; box-sizing: border-box; margin-top: 6px;
+      padding: 7px 8px; border: 1px solid #dcdce3; border-radius: 7px;
+      font-size: 12px; color: #515154; background: #fff; font-family: inherit; outline: none;
+    }
+    .set-select:focus, .set-input:focus { border-color: #7b7bd4; }
+    .set-rename .set-hint { margin-top: 7px; }
+    .set-preview {
+      margin-top: 8px; padding: 7px 9px; border-radius: 6px;
+      background: #fff; border: 1px dashed #d8d8e2;
+      font-size: 11px; color: #3a3a40; word-break: break-all; line-height: 1.5;
+    }
+    .set-select[disabled], .set-input[disabled] { background: #f2f2f5; }
+    .set-input[hidden] { display: none; }
+    /* 格式选择让设置弹窗变高，沿用批量发送弹窗那套限高 + body 滚动 */
+    #setMask .modal { max-height: 92vh; display: flex; flex-direction: column; }
+    #setMask .modal-body { overflow-y: auto; }
+    #setMask .modal-head, #setMask .modal-foot { flex: 0 0 auto; }
   
   /* 批量发送弹窗 */
   .bc-list { max-height: 92px; overflow: auto; border: 1px solid var(--line, #e5e5e5); border-radius: 8px; padding: 6px 8px; }
@@ -381,6 +405,17 @@
           <button class="mbtn" id="setBrowse">浏览…</button>
         </div>
         <p class="set-hint" id="setDlHint">所有账号下载的文件都直接存进这个文件夹，不再新建子文件夹。<br>留空则使用系统「下载」文件夹。</p>
+        <label class="set-check">
+          <input type="checkbox" id="setDownloadRename">
+          <span>下载的文件<b>按所选格式自动命名</b>（不勾选则保留原文件名）</span>
+        </label>
+        <div class="set-rename" id="setRenameBox">
+          <div class="set-label">命名格式</div>
+          <select id="setRenameFormat" class="set-select"></select>
+          <input id="setRenameCustom" class="set-input" hidden placeholder="例：{账号}-{点日期}-{文件名}">
+          <p class="set-hint">可用占位符：<code>{账号}</code> <code>{日期}</code> <code>{点日期}</code> <code>{时间}</code> <code>{文件名}</code>（含扩展名，不用再写）。</p>
+          <div class="set-preview" id="setRenamePreview">预览：—</div>
+        </div>
         <label class="set-check">
           <input type="checkbox" id="setCloseExit">
           <span>点右上角关闭时<b>直接退出程序</b>（不勾选则最小化到托盘）</span>

@@ -52,6 +52,14 @@ if (FULL_ONLY && CORE_ONLY) {
   process.exit(1);
 }
 
+// 只清理历史构建，不发版（给"磁盘又满了"用）
+if (flag('--prune-only')) {
+  const nb = pruneBuilds(2);
+  const nd = pruneDist(2);
+  console.log('已清理: build ' + nb + ' 个目录, dist ' + nd + ' 个旧包（保留最近 2 个）');
+  process.exit(0);
+}
+
 if (!VERSION) {
   console.error('用法: node _release\\release.js <版本号>  [选项]');
   console.error('  例: node _release\\release.js 4.2');
@@ -163,7 +171,7 @@ function bumpVersion(ver) {
 }
 
 // ---------- 构建便携版 ----------
-const APP_FILES = ['main.js', 'preload.js', 'member-preload.js', 'image-picker-inject.js', 'index.html', 'renderer.js', 'app.ico', 'README.md', 'LICENSE'];
+const APP_FILES = ['main.js', 'download-name.js', 'preload.js', 'member-preload.js', 'image-picker-inject.js', 'index.html', 'renderer.js', 'app.ico', 'README.md', 'LICENSE'];
 
 // 清空/删除一个目录。
 // 不能用 fs.rmSync(recursive): 本机安全策略对"单次删除超过 50 个文件"会直接拒绝,
@@ -181,6 +189,66 @@ function wipeDir(dir) {
   } catch (e) {}
   if (r.error) die('清空目录失败: ' + dir + ' (' + r.error.message + ')');
   if (r.status !== null && r.status >= 8) die('清空目录失败: ' + dir + ' (robocopy 退出码 ' + r.status + ')');
+}
+
+// 静默删除一个目录（失败只返回 false，不像 wipeDir 那样 die）
+function removeDirQuiet(dir) {
+  if (!fs.existsSync(dir)) return true;
+  try {
+    const empty = path.join(require('os').tmpdir(), 'dbmo_empty_' + process.pid + '_' + Date.now());
+    fs.mkdirSync(empty, { recursive: true });
+    spawnSync('robocopy', [empty, dir, '/MIR', '/NFL', '/NDL', '/NJH', '/NJS', '/MT:8'], { stdio: 'ignore' });
+    try { fs.rmdirSync(empty); } catch (e) {}
+    try { fs.rmdirSync(dir); } catch (e) {}
+  } catch (e) {
+    return false;
+  }
+  return !fs.existsSync(dir);
+}
+
+// build/ 里每个版本留一份 100+MB，历史目录从来不删，实测堆到 360MB。
+// 只保留最近 keep 个（按修改时间），其余清掉。
+function pruneBuilds(keep) {
+  const dir = path.join(__dirname, 'build');
+  if (!fs.existsSync(dir)) return 0;
+  let items = [];
+  try {
+    items = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => ({ name: d.name, t: fs.statSync(path.join(dir, d.name)).mtimeMs }));
+  } catch (e) { return 0; }
+  items.sort((a, b) => b.t - a.t);
+  let n = 0;
+  for (const it of items.slice(keep)) {
+    const p = path.join(dir, it.name);
+    if (removeDirQuiet(p)) { console.log('  清理 build/' + it.name); n++; }
+    else console.log('  跳过 build/' + it.name + '（删除失败）');
+  }
+  return n;
+}
+
+// dist/ 里的旧 zip 同理，只保留最近 keep 个
+function pruneDist(keep) {
+  const dir = path.join(__dirname, 'dist');
+  if (!fs.existsSync(dir)) return 0;
+  let zips = [];
+  try {
+    zips = fs.readdirSync(dir)
+      .filter((f) => /\.zip$/i.test(f))
+      .map((f) => ({ f: f, t: fs.statSync(path.join(dir, f)).mtimeMs }));
+  } catch (e) { return 0; }
+  zips.sort((a, b) => b.t - a.t);
+  let n = 0;
+  for (const it of zips.slice(keep)) {
+    try {
+      fs.rmSync(path.join(dir, it.f), { force: true });
+      console.log('  清理 dist/' + it.f);
+      n++;
+    } catch (e) {
+      console.log('  跳过 dist/' + it.f + '（' + e.message + '）');
+    }
+  }
+  return n;
 }
 
 function buildPortable(ver) {
@@ -400,15 +468,56 @@ function sanitizeFile(relPath, content) {
   const before = content.toString('utf-8');
   let s = before;
   if (relPath === 'main.js') {
-    s = s.replace(/^const APP_VERSION_LABEL = '[^']*';\r?\n/m, '');
-    s = s.replace(/message: '豆包多开管理器 ' \+ APP_VERSION_LABEL,/, "message: '豆包多开管理器 v' + APP_VERSION,");
-    s = s.replace(/versionLabel: APP_VERSION_LABEL,/, "versionLabel: 'v' + APP_VERSION,");
+    // 4.2.4 之后 main.js 用 app.isPackaged 运行时判断开发版，源码里不再有硬编码的版本字符串，
+    // 所以不需要在这里删了。留着这段反而危险：删掉定义会让引用处报错。
   } else if (relPath === 'README.md') {
     s = s.replace(/(version-[\d.]+)--dev/g, '$1');
   }
   if (s === before) return content;
   console.log('   清理开发标识: ' + relPath + '  (' + before.length + ' → ' + s.length + ' 字节)');
   return Buffer.from(s, 'utf-8');
+}
+
+// ---------- 发版前：工作区是否干净 ----------
+// 4.2.4 踩过一次：README 的新版一直在工作区没提交，导致 GitHub 主页显示旧内容。
+// 这里只警告不中断 —— 有时候确实要带着未提交的改动发（比如临时调参数试一下）。
+function checkDirtyWorktree() {
+  const r = spawnSync('git', ['status', '--porcelain'], { cwd: ROOT, encoding: 'utf8' });
+  if (r.error) { say(0, '工作区检查跳过（' + r.error.message + '）'); return; }
+  const lines = String(r.stdout || '').split('\n').filter((l) => l.trim());
+  if (!lines.length) { say(0, '工作区干净'); return; }
+  console.log('');
+  console.log('  ⚠️  工作区有 ' + lines.length + ' 处未提交改动，发布包会按当前工作区的样子打：');
+  for (const l of lines.slice(0, 10)) console.log('      ' + l);
+  if (lines.length > 10) console.log('      ...（还有 ' + (lines.length - 10) + ' 处）');
+  console.log('');
+  console.log('     要先把它们提交/撤销就现在 Ctrl+C，否则继续。');
+  console.log('');
+}
+
+// ---------- 打包后：产物里不能有开发标识 ----------
+// 4.2.4 踩过一次：release.js 直接复制工作区文件，把 APP_VERSION_LABEL = '开发版v4.2.4'
+// 和 README 的 --dev 徽章带进了发布包。现在 sanitizeFile() 会清理，
+// 这里再做一次断言，万一以后漏了某个文件能立刻炸出来。
+function verifyArtifact(ver) {
+  const stageApp = path.join(__dirname, 'build', 'core-v' + ver, 'resources', 'app');
+  if (!fs.existsSync(stageApp)) return;   // 没产出核心包（--full-only）就跳过
+  const problems = [];
+  const readText = (f) => {
+    const fp = path.join(stageApp, f);
+    return fs.existsSync(fp) ? fs.readFileSync(fp, 'utf-8') : null;
+  };
+  // main.js 不再检查：开发版标识已改为 app.isPackaged 运行时判断，
+  // 源码里带的「开发版v」字面量是正常的，打包后不会显示。
+  const rm = readText('README.md');
+  if (rm && /version-[\d.]+--dev/.test(rm)) problems.push('README.md 的版本徽章还是 --dev');
+  const pj = readText('package.json');
+  if (pj && /"version":\s*"[^"]*dev/i.test(pj)) problems.push('package.json 的版本号带 dev');
+  if (problems.length) {
+    die('产物自检失败，包里带了开发标识：\n    - ' + problems.join('\n    - ')
+      + '\n  去检查 sanitizeFile() 有没有覆盖到这个文件。');
+  }
+  say(3, '产物自检通过（无开发标识残留）');
 }
 
 function zipCore(ver) {
@@ -424,7 +533,7 @@ function zipCore(ver) {
   }
   // docs 是 README 里的截图（5 张 PNG，约 340 KB）。core 包不带：
   // ① 它是增量更新包，职责只是替换代码；
-  // ② 1Panel 的上传上限是 512 KB（524288 字节），带上就超了，超了会被静默丢弃。
+  // ② 核心包要保持几百 KB，带上 docs 会超过 512 KB，部分更新源会静默丢弃大文件。
   // 完整包（buildPortable）仍然带 docs，首次安装的用户照样能看到截图。
   fs.writeFileSync(path.join(stageApp, 'package.json'), leanPackageJson(ver), 'utf8');
 
@@ -549,7 +658,7 @@ function fullNotes(ver, body) {
 // ---------- 推源码 ----------
 // 推送到 main 的文件清单。注意 app.ico 是二进制, 走 blob API 时用 base64。
 // v4.2: 补 app.ico(之前漏了, 换图标后源码里还是旧的) 和发版脚本本身。
-const SRC_FILES = ['main.js', 'preload.js', 'member-preload.js', 'image-picker-inject.js', 'index.html', 'renderer.js', 'package.json', 'package-lock.json', 'README.md', 'app.ico', '_release/release.js'];
+const SRC_FILES = ['main.js', 'download-name.js', 'preload.js', 'member-preload.js', 'image-picker-inject.js', 'index.html', 'renderer.js', 'package.json', 'package-lock.json', 'README.md', 'app.ico', '_release/release.js'];
 // 本次的更新说明也要带上(文件名随版本号变, 在 pushSource 里动态补)
 
 async function pushSource(ver, notesBody) {
@@ -648,6 +757,8 @@ async function uploadAssets(release, zipPaths) {
 (async () => {
   console.log('\n===== 豆包多开管理器 发版 v' + VER + (DRY ? '  [DRY RUN]' : '') + ' =====\n');
 
+  checkDirtyWorktree();
+
   const cur = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
   say(0, '当前版本: ' + cur + ' → 目标版本: ' + VER);
   // 允许相等: 手动把 package.json 改到目标版本后再发版是常见做法。
@@ -664,6 +775,7 @@ async function uploadAssets(release, zipPaths) {
   // --full-only: 只发完整包, 不产出也不上传核心包。
   // 代价是客户端「检查更新」要下 143 MB(而不是 300 KB)。
   const corePath = FULL_ONLY ? null : zipCore(VER);
+  verifyArtifact(VER);
 
   if (DRY) {
     console.log('\n[DRY RUN] 本地构建与打包已完成, 未触碰 GitHub。');
@@ -705,6 +817,15 @@ async function uploadAssets(release, zipPaths) {
     if (names.length && !/-core\.zip$/i.test(names[0])) {
       console.log('\n!! 警告: 第一个资产不是核心包(' + names[0] + '), 旧客户端会去下完整包。');
     }
+  }
+
+  // 发版成功顺手清历史构建（dry-run 在上面已经 exit，走不到这里）
+  try {
+    const nb = pruneBuilds(2);
+    const nd = pruneDist(2);
+    if (nb || nd) console.log('\n已清理旧构建: build ' + nb + ' 个, dist ' + nd + ' 个');
+  } catch (e) {
+    console.log('\n清理旧构建失败（不影响发版）: ' + e.message);
   }
 
   console.log('\n===== 完成 =====');

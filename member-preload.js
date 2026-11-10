@@ -10,10 +10,15 @@ let __diag = () => {};
 try {
   const fs = require('fs');
   const path = require('path');
-  const LOG = path.join(__dirname, 'userdata', 'member-preload.log');
+  // 数据目录由主进程通过 additionalArguments 传进来（--dlm-data-dir=...）。
+  // 打包后 __dirname 是 resources/app，不能往那里写；开发版两者相同。
+  const argv0 = Array.isArray(process.argv) ? process.argv : [];
+  const dataArg = argv0.find((a) => typeof a === 'string' && a.indexOf('--dlm-data-dir=') === 0);
+  const DATA_DIR = dataArg ? dataArg.slice('--dlm-data-dir='.length) : path.join(__dirname, 'userdata');
+  const LOG = path.join(DATA_DIR, 'member-preload.log');
   __diag = (s) => {
     try {
-      fs.mkdirSync(path.join(__dirname, 'userdata'), { recursive: true });
+      fs.mkdirSync(DATA_DIR, { recursive: true });
       const st = fs.existsSync(LOG) ? fs.statSync(LOG) : null;
       if (st && st.size > 256 * 1024) fs.unlinkSync(LOG);
       fs.appendFileSync(LOG, '[' + new Date().toISOString() + '] pid=' + process.pid + ' ' + s + '\n', 'utf-8');

@@ -125,6 +125,15 @@ btnAdd.onclick = async () => {
 
 // ---- 双击就地编辑改名(无弹窗) ----
 let editing = false;
+
+// 弹窗层级：五个 mask 的 CSS z-index 都是 200，同值时靠 DOM 顺序决定谁在上。
+// logMask 写在 HTML 最后，所以先开更新日志、再开更新弹窗时，日志会盖住更新。
+// 打开时给当前这个抬一个递增的值，后开的永远在上。
+let __maskZ = 200;
+function raiseMask(el) {
+  if (!el) return;
+  try { el.style.zIndex = String(++__maskZ); } catch (e) {}
+}
 function startInlineEdit(spanEl, acc) {
   if (editing) return;
   editing = true;
@@ -344,9 +353,9 @@ function updProgress(pct) {
 }
 // 账号视图是原生 WebContentsView, 会盖住 DOM 弹窗(登录后点检查更新"没反应"的元凶),
 // 所以弹窗开/关都要通知主进程: 弹窗期间隐藏视图, 关掉后恢复
-function setAccountViewVisible(visible) {
+function setAccountViewVisible(visible, id) {
   try {
-    if (window.api && window.api.uiModal) window.api.uiModal(!visible);
+    if (window.api && window.api.uiModal) window.api.uiModal(!visible, id);
   } catch (e) {}
 }
 // 版本徽标兼作后台下载进度条: 更新弹窗关掉后, 进度只能显示在这里
@@ -363,11 +372,12 @@ function closeUpdateModal() {
   if (updPhase === 'applying') return; // 已经在重启更新, 不许关
   // downloading 阶段允许关: 下载跑在主进程, 关掉弹窗照样下, 进度转到版本徽标上
   updMask.hidden = true;
-  setAccountViewVisible(true);
+  setAccountViewVisible(true, 'upd');
 }
 function openUpdateModal() {
   updMask.hidden = false;
-  setAccountViewVisible(false);
+  raiseMask(updMask);
+  setAccountViewVisible(false, 'upd');
   // 焦点原来可能停在账号页面里(键盘事件到不了这里), 抢回来
   try { updMask.focus({ preventScroll: true }); } catch (e) {}
   // 下载/安装进行中不要重新检查: 主进程会把正在写入的更新包当旧包作废
@@ -383,28 +393,91 @@ const setBrowse = document.getElementById('setBrowse');
 const setReset = document.getElementById('setReset');
 const setSave = document.getElementById('setSave');
 const setCloseExit = document.getElementById('setCloseExit');
+const setDownloadRename = document.getElementById('setDownloadRename');
+const setRenameBox = document.getElementById('setRenameBox');
+const setRenameFormat = document.getElementById('setRenameFormat');
+const setRenameCustom = document.getElementById('setRenameCustom');
+const setRenamePreview = document.getElementById('setRenamePreview');
 const setWarn = document.getElementById('setWarn');
+
+// 下载命名格式: 下拉的选项来自主进程 download-name.js（IPC download:formats），
+// 这里只做展示层预览, 不重复维护一份模板。
+let renameFormats = [];
+let renameDefaultFormat = 'account_date_name';
+let renameDefaultCustom = '{账号}-{点日期}-{文件名}';
+
+function renderRenamePreview() {
+  const key = setRenameFormat.value;
+  let tpl = '';
+  if (key === 'custom') tpl = setRenameCustom.value;
+  else {
+    const hit = renameFormats.find(o => o.key === key);
+    tpl = hit ? hit.tpl : '';
+  }
+  const demo = {
+    '{账号}': '账号3', '{日期}': '2026-11-10', '{点日期}': '2026.11.10',
+    '{时间}': '10.11.13', '{文件名}': '奶白色钢制衣柜视频制作方案.mp4'
+  };
+  let s = String(tpl || '').trim();
+  for (const k of Object.keys(demo)) s = s.split(k).join(demo[k]);
+  setRenamePreview.textContent = '预览：' + (s || '（模板为空，保存时会退回默认格式）');
+  setRenameCustom.hidden = key !== 'custom';
+}
+
+function syncRenameUi() {
+  const on = setDownloadRename.checked;
+  setRenameBox.classList.toggle('is-off', !on);
+  setRenameFormat.disabled = !on;
+  setRenameCustom.disabled = !on;
+  renderRenamePreview();
+}
+
+setDownloadRename.onchange = syncRenameUi;
+setRenameFormat.onchange = renderRenamePreview;
+setRenameCustom.oninput = renderRenamePreview;
 
 // warnMsg 传了就在弹窗顶部显示红字(v4.2: 默认下载位置不可用时用)
 async function openSettingsModal(warnMsg) {
   try {
-    const [dir, prefs] = await Promise.all([window.api.getDownloadDir(), window.api.prefsGet()]);
+    const [dir, prefs, fmts] = await Promise.all([
+      window.api.getDownloadDir(),
+      window.api.prefsGet(),
+      window.api.downloadFormats ? window.api.downloadFormats().catch(() => null) : null
+    ]);
     setDlPath.value = dir.dir || '';
     setDlPath.title = '当前：' + (dir.dir || '（不可用，请手动选择）');
     setDlPath.dataset.default = dir.defaultDir || '';
     // closeToTray === false 才表示"关闭即退出"
     setCloseExit.checked = prefs.closeToTray === false;
+    setDownloadRename.checked = prefs.downloadRename === true;
+    if (fmts && Array.isArray(fmts.options)) {
+      renameFormats = fmts.options;
+      renameDefaultFormat = fmts.defaultFormat || renameDefaultFormat;
+      renameDefaultCustom = fmts.defaultCustom || renameDefaultCustom;
+      setRenameFormat.innerHTML = '';
+      for (const o of fmts.options) {
+        const op = document.createElement('option');
+        op.value = o.key;
+        op.textContent = o.label;
+        setRenameFormat.appendChild(op);
+      }
+    }
+    setRenameFormat.value = renameFormats.some(o => o.key === prefs.downloadRenameFormat)
+      ? prefs.downloadRenameFormat : renameDefaultFormat;
+    setRenameCustom.value = String(prefs.downloadRenameCustom || renameDefaultCustom);
+    syncRenameUi();
   } catch (e) {}
   setWarn.hidden = !warnMsg;
   setWarn.textContent = warnMsg || '';
   setMask.hidden = false;
-  setAccountViewVisible(false);
+  raiseMask(setMask);
+  setAccountViewVisible(false, 'set');
   try { setMask.focus({ preventScroll: true }); } catch (e) {}
 }
 
 function closeSettingsModal() {
   setMask.hidden = true;
-  setAccountViewVisible(true);
+  setAccountViewVisible(true, 'set');
 }
 
 setClose.onclick = () => closeSettingsModal();
@@ -424,6 +497,10 @@ setBrowse.onclick = async () => {
 setReset.onclick = () => {
   setDlPath.value = setDlPath.dataset.default || '';
   setDlPath.title = '当前：' + setDlPath.value;
+  setDownloadRename.checked = false;   // 下载改名默认关闭
+  setRenameFormat.value = renameDefaultFormat;
+  setRenameCustom.value = renameDefaultCustom;
+  syncRenameUi();
 };
 
 setSave.onclick = async () => {
@@ -434,10 +511,13 @@ setSave.onclick = async () => {
   try {
     await window.api.prefsSet({
       downloadDir: toSave,
-      closeToTray: !setCloseExit.checked   // 勾了"直接退出" => closeToTray=false
+      closeToTray: !setCloseExit.checked,   // 勾了"直接退出" => closeToTray=false
+      downloadRename: setDownloadRename.checked,
+      downloadRenameFormat: setRenameFormat.value,
+      downloadRenameCustom: String(setRenameCustom.value || '').trim()
     });
     closeSettingsModal();
-    toast(toSave ? ('下载位置已保存：' + toSave) : '已恢复默认下载位置（系统「下载」文件夹）');
+    toast(toSave ? ('设置已保存：' + toSave) : '已恢复默认设置（系统「下载」文件夹、下载改名关闭、默认格式）');
   } catch (e) {
     toast('保存失败：' + (e && e.message ? e.message : e));
   }
@@ -608,15 +688,16 @@ updClose.onclick = closeUpdateModal;
   function close() {
     mask.hidden = true;
     pendingId = null;
-    try { api.uiModal(false); } catch (e) {}
+    try { api.uiModal(false, 'del'); } catch (e) {}
   }
 
   function open(id, label) {
     pendingId = id;
     titleEl.textContent = '删除账号「' + (label || id) + '」？';
     mask.hidden = false;
+    raiseMask(mask);
     mask.focus();
-    try { api.uiModal(true); } catch (e) {}
+    try { api.uiModal(true, 'del'); } catch (e) {}
   }
 
   okBtn.addEventListener('click', async () => {
@@ -645,6 +726,19 @@ updClose.onclick = closeUpdateModal;
 
 // ============ 更新日志（只记新增 / 优化 / 修复）============
 const CHANGELOG = [
+  {
+    v: '4.2.5',
+    items: [
+      ['new', '帮助菜单可打开当前账号的控制台（Ctrl+Shift+F12），方便排查豆包页面'],
+      ['new', '设置里可开启「下载改名」，提供 5 种命名格式 + 自定义模板和实时预览（默认关闭，不写入任何清单文件）'],
+      ['imp', '账号和设置的配置文件改成原子写入：写临时文件→备份旧版→原子替换，读取失败时优先从备份恢复，坏文件另存 .corrupt 留证'],
+      ['imp', '弹窗改成集合管理，同时开着多个弹窗时关掉其中一个不会再让账号视图跳出来'],
+      ['imp', '批量发送的账号间隔等待可中断，点停止立即响应（原来要等完当前间隔）'],
+      ['fix', '开发版/正式版的版本标签改由 app.isPackaged 运行时判断，不再手写版本字符串（4.2.4 就是漏改这行把「开发版v4.2.4」发出去的）'],
+      ['fix', 'README 里写的默认下载目录与代码不一致（实际是系统「下载」文件夹）'],
+      ['fix', 'package.json 补上 engines.node >=22.12.0，与依赖实际要求一致']
+    ]
+  },
   {
     v: '4.2.4',
     items: [
@@ -744,16 +838,17 @@ const CHANGELOG = [
   function open() {
     render();
     mask.hidden = false;
+    raiseMask(mask);
     // 内容刚插进 DOM，浏览器还没算完布局，这时设 scrollTop 会被忽略，
     // 放到下一帧再滚到顶部才生效
     requestAnimationFrame(() => { body.scrollTop = 0; });
     mask.focus();
-    try { api.uiModal(true); } catch (e) {}
+    try { api.uiModal(true, 'log'); } catch (e) {}
   }
 
   function close() {
     mask.hidden = true;
-    try { api.uiModal(false); } catch (e) {}
+    try { api.uiModal(false, 'log'); } catch (e) {}
   }
 
   closeBtn.addEventListener('click', close);
@@ -875,14 +970,15 @@ refresh();
       listEl.innerHTML = '<div style="font-size:12px;color:#d33;padding:4px">读取账号失败</div>';
     }
     mask.hidden = false;
+    raiseMask(mask);
     mask.focus();
-    try { api.uiModal(true); } catch (e) {}
+    try { api.uiModal(true, 'bc'); } catch (e) {}
   }
 
   function close() {
     if (running) return;   // 跑的时候不让关，避免误操作
     mask.hidden = true;
-    try { api.uiModal(false); } catch (e) {}
+    try { api.uiModal(false, 'bc'); } catch (e) {}
   }
 
   const pickBtn = document.getElementById('bcPickImgs');

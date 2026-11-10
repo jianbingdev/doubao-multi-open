@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld('api', {
   // 下载路径设置(v4.2)
   chooseDownloadDir: () => ipcRenderer.invoke('downloads:choose'),
   getDownloadDir: () => ipcRenderer.invoke('downloads:getDir'),
+  // 下载命名格式列表(v4.2.5) —— 数据源在主进程的 download-name.js
+  downloadFormats: () => ipcRenderer.invoke('download:formats'),
 
   // 自动更新(v3.0.15)
   appInfo: () => ipcRenderer.invoke('app:info'),
@@ -32,7 +34,7 @@ contextBridge.exposeInMainWorld('api', {
   updateApply: () => ipcRenderer.invoke('update:apply'),
   updateSetSource: (url) => ipcRenderer.invoke('update:setSource', url),
   // 弹窗开关: 让主进程临时隐藏账号视图, 否则原生 WebContentsView 会盖住界面弹窗
-  uiModal: (open) => ipcRenderer.invoke('ui:modal', open),
+  uiModal: (open, id) => ipcRenderer.invoke('ui:modal', open, id),
 
   // 主进程推送
   onAccountReady: (cb) => ipcRenderer.on('account:ready', (e, d) => cb(d)),

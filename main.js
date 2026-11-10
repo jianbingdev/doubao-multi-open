@@ -17,6 +17,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
+const dlName = require('./download-name');   // 纯函数: 下载自动命名, 不依赖 electron
 
 // v3.0.12: 打包成便携版后没有 bat 帮忙传参数, 而部分机器的 GPU 进程沙箱会被系统策略拦截
 // (表现为连续报 GPU process isn't usable 然后白屏/闪退)。在这里兜底, 双击 exe 即可启动。
@@ -104,21 +105,68 @@ try {
 log('=== v3 启动 ===');
 
 // ---------- 偏好设置(先于 ready 读取, 因为兼容模式要提前决定) ----------
+// ---------- JSON 原子读写 ----------
+// 原写法是 writeFileSync 直接覆盖、读失败就 return 空对象。
+// accounts.json 一旦因断电或强杀进程写坏，下次启动读成空数组，
+// 再添加一个账号就把空数组写回去 —— 原来的账号列表彻底没了，
+// userdata 里那些登录态分区也变成认不出来的孤儿。
+// 现在：写临时文件 -> 备份旧文件 -> rename 原子替换；
+// 读失败优先用备份，备份也没有就返回 fallback 但**不动原文件**。
+function atomicWriteJson(file, data) {
+  const tmp = file + '.tmp';
+  const bak = file + '.bak';
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
+    if (fs.existsSync(file)) {
+      try { fs.copyFileSync(file, bak); } catch (e) {}
+    }
+    fs.renameSync(tmp, file);
+    return true;
+  } catch (e) {
+    log('写入失败 ' + path.basename(file) + ': ' + e.message);
+    try { fs.rmSync(tmp, { force: true }); } catch (err) {}
+    return false;
+  }
+}
+
+function readJsonSafe(file, fallback, label) {
+  const bak = file + '.bak';
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    const raw = fs.readFileSync(file, 'utf-8');
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
+  } catch (e) {
+    log('读取失败 ' + (label || path.basename(file)) + ': ' + e.message);
+    // 留一份损坏现场的副本：恢复之后原文件会被正常数据覆盖，
+    // 事后想知道"当时坏在哪"就靠这个 .corrupt 文件了。
+    try { fs.copyFileSync(file, file + '.corrupt'); } catch (err0) {}
+    try {
+      if (fs.existsSync(bak)) {
+        const fromBak = JSON.parse(fs.readFileSync(bak, 'utf-8'));
+        log('已从备份恢复 ' + path.basename(bak));
+        return fromBak;
+      }
+    } catch (err) {}
+    log('[!] ' + path.basename(file) + ' 内容异常且无可用备份，本次用空值继续（原文件未改动）');
+    return fallback;
+  }
+}
+
 const PREFS_FILE = path.join(USER_DIR, 'prefs.json');
 function loadPrefs() {
-  try { return JSON.parse(fs.readFileSync(PREFS_FILE, 'utf-8')); } catch (e) { return {}; }
+  const v = readJsonSafe(PREFS_FILE, {}, 'prefs');
+  return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
 }
 // compatGpu 默认 false（保留 GPU 加速）。
 // 2026-10-28 排查结论：豆包的图片变成灰块，根因是「往页面插全屏合成层」——
 // 早期版本把复选框插进图片容器、后来又把浮层做成 width/height:100%，都会触发。
 // 改成 0×0 容器 + 子元素 fixed 定位后，GPU 开着也正常（实测 4/4 张 CDN 图全加载）。
 // 这个开关留着是兜底：万一某些机器上仍有问题，手动设 true 即可退化成软件渲染。
-let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '', compatGpu: false }, loadPrefs());
+let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '', compatGpu: false, downloadRename: false, downloadRenameFormat: dlName.DEFAULT_FORMAT, downloadRenameCustom: dlName.DEFAULT_CUSTOM }, loadPrefs());
 function savePrefs() {
-  try {
-    fs.mkdirSync(USER_DIR, { recursive: true });
-    fs.writeFileSync(PREFS_FILE, JSON.stringify(prefs, null, 2), 'utf-8');
-  } catch (e) { log('savePrefs 失败: ' + e.message); }
+  atomicWriteJson(PREFS_FILE, prefs);
 }
 
 if (prefs.compatGpu) {
@@ -150,13 +198,11 @@ const forceQuitting = { value: false };
 // ---------- 账号持久化 ----------
 const accountsFile = () => path.join(USER_DIR, 'accounts.json');
 function loadAccounts() {
-  try { return JSON.parse(fs.readFileSync(accountsFile(), 'utf-8') || '[]'); } catch (e) { return []; }
+  const list = readJsonSafe(accountsFile(), [], 'accounts');
+  return Array.isArray(list) ? list : [];
 }
 function saveAccounts(list) {
-  try {
-    fs.mkdirSync(USER_DIR, { recursive: true });
-    fs.writeFileSync(accountsFile(), JSON.stringify(list, null, 2), 'utf-8');
-  } catch (e) { log('saveAccounts 失败: ' + e.message); }
+  atomicWriteJson(accountsFile(), Array.isArray(list) ? list : []);
 }
 
 // ---------- 视图几何 ----------
@@ -179,7 +225,7 @@ function attachView(view) {
   if (!view || !mainWindow || mainWindow.isDestroyed()) return;
   try { mainWindow.contentView.addChildView(view); } catch (e) {}
   try { view.setBounds(getContentBounds()); } catch (e) {}
-  try { view.setVisible(!uiModalOpen); } catch (e) {}
+  try { view.setVisible(!isUiModalOpen()); } catch (e) {}
 }
 
 function detachView(view) {
@@ -191,18 +237,26 @@ function detachView(view) {
 // 原生视图永远绘制在 DOM 之上, 且它从侧栏右侧铺满整个内容区 —— 只要登录了账号,
 // 居中的 380px 弹窗就整块被豆包页面盖住, 用户看到的就是"点了检查更新没反应"。
 // 所以弹窗打开期间把激活视图隐藏, 关闭时再显示回来。
-let uiModalOpen = false;
+// 原来是一个布尔 uiModalOpen：同时开两个弹窗时，关掉其中一个就会把视图恢复出来，
+// 另一个弹窗又被原生视图盖住（"点了没反应"）。改成集合，只有全关完才恢复视图。
+const uiModalStack = new Set();
+function isUiModalOpen() { return uiModalStack.size > 0; }
+function setUiModal(id, open) {
+  const key = String(id || 'default');
+  if (open) uiModalStack.add(key); else uiModalStack.delete(key);
+  applyViewVisibility();
+}
 
 function applyViewVisibility() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const v = getActiveView();
   if (!v) return;
-  log('弹窗' + (uiModalOpen ? '打开: 隐藏账号视图' : '关闭: 恢复账号视图'));
+  log('弹窗' + (isUiModalOpen() ? '打开(' + uiModalStack.size + '个): 隐藏账号视图' : '全部关闭: 恢复账号视图'));
   try {
-    v.setVisible(!uiModalOpen);
+    v.setVisible(!isUiModalOpen());
     // 焦点原来在账号视图里, 视图藏起来后键盘事件就没人接了(Esc/Enter 全失效),
     // 所以弹窗期间把焦点交回主窗口
-    if (uiModalOpen && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+    if (isUiModalOpen() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
       mainWindow.webContents.focus();
     }
     return;
@@ -216,6 +270,28 @@ function applyViewVisibility() {
       v.setBounds(getContentBounds());
     }
   } catch (e) { log('切换视图可见性失败: ' + e.message); }
+}
+
+// 下载改名要标出是哪个账号下的。后台账号也可能触发下载, 所以先按
+// WebContents 反查 viewPool; blob 下载拿不到 WebContents 时退回当前账号。
+function accountLabelForDownload(item) {
+  let wc = null;
+  try { wc = item.getWebContents && item.getWebContents(); } catch (e) {}
+  let id = null;
+  if (wc) {
+    try {
+      for (const [k, v] of viewPool) {
+        if (v && v.webContents && v.webContents === wc) { id = k; break; }
+      }
+    } catch (e) {}
+  }
+  if (!id) id = activeAccountId;
+  if (!id) return '未分配账号';
+  try {
+    const a = loadAccounts().find(x => x.id === id);
+    if (a && a.label) return a.label;
+  } catch (e) {}
+  return String(id);
 }
 
 // ---------- 会话级钩子(下载/权限), 每个分区只挂一次 ----------
@@ -246,6 +322,9 @@ function ensureSessionHooks(accountId) {
   } catch (e) { log('webRequest 钩子失败: ' + e.message); }
 
   // 下载: 统一存到设置里的下载目录(默认 程序目录\downloads), 不按账号分子目录
+  // v4.2.5: 设置里打开「下载改名」时, 按选中的格式模板重命名（默认 账号_日期_原文件名）。
+  // 开关关闭时 name === original, 下面这段跟原来的行为逐字等价(原名 + 同名 (1)(2)),
+  // 不多做一个动作, 也不会写任何额外文件。
   ses.on('will-download', (event, item) => {
     // 一个可用的目录都没有: 取消这次下载, 弹设置窗口让用户自己选
     const dir = getDownloadDir();
@@ -255,16 +334,21 @@ function ensureSessionHooks(accountId) {
       pushToRenderer('download:noDir');
       return;
     }
+    const original = item.getFilename() || ('file-' + Date.now());
+    let name = original;
+    if (prefs.downloadRename === true) {
+      try { name = dlName.formatFileName(original, accountLabelForDownload(item), null, prefs.downloadRenameFormat, prefs.downloadRenameCustom); }
+      catch (e) { log('下载命名失败, 保留原名: ' + e.message); name = original; }
+    }
     try {
-      const base = item.getFilename() || ('file-' + Date.now());
-      let savePath = path.join(dir, base);
+      let savePath = path.join(dir, name);
       let i = 1;
-      while (fs.existsSync(savePath)) {
-        const ext = path.extname(base), stem = path.basename(base, ext);
+      const ext = path.extname(name), stem = path.basename(name, ext);
+      while (fs.existsSync(savePath) && i < 10000) {
         savePath = path.join(dir, stem + '(' + i + ')' + ext); i++;
       }
       item.setSavePath(savePath);
-      log('下载开始: ' + base);
+      log('下载开始: ' + original + (name !== original ? '  -> ' + name : ''));
     } catch (e) { log('下载设置失败: ' + e.message); }
     item.once('done', (e2, state) => {
       if (state === 'completed') {
@@ -476,6 +560,9 @@ function createViewForAccount(account) {
       sandbox: false,
       // v3.0.5: 采集套餐/会员信息(在主世界钩订阅接口), 见 member-preload.js
       preload: path.join(APP_DIR, 'member-preload.js'),
+      // 便携版里 __dirname 是 resources/app, 而数据目录在 exe 同级;
+      // 把真实数据目录传给 preload, 免得它把诊断日志写进 resources/app/userdata。
+      additionalArguments: ['--dlm-data-dir=' + USER_DIR],
       // v3.0.3: 后台账号的页面也要保持正常节奏, 否则流式回复渲染被节流,
       // 完成信号会拖到很晚才出现(跨账号完成提醒会失效)
       backgroundThrottling: false
@@ -594,7 +681,7 @@ function setActiveAccount(id) {
   attachView(view);
   activeAccountId = id;
   // 弹窗正处于打开状态时切号(如 Ctrl+1), 新挂上来的视图同样会盖住弹窗
-  if (uiModalOpen) applyViewVisibility();
+  if (isUiModalOpen()) applyViewVisibility();
   prefs.lastActiveId = id;
   savePrefs();
   log('切换账号: ' + account.label + ' (池=' + viewPool.size + ')');
@@ -1468,6 +1555,19 @@ function buildAppMenu() {
           accelerator: 'CmdOrCtrl+U',
           click: () => { ShowMain(); pushToRenderer('menu:checkUpdate'); }
         },
+        {
+          label: '打开当前账号控制台',
+          accelerator: 'CmdOrCtrl+Shift+F12',
+          click: () => {
+            const v = getActiveView();
+            if (!v) { notifyToast('没有已打开的账号页面'); return; }
+            try { v.webContents.openDevTools({ mode: 'detach' }); }
+            catch (e) {
+              log('打开控制台失败: ' + e.message);
+              notifyToast('打开控制台失败');
+            }
+          }
+        },
         { type: 'separator' },
         {
           label: '关于', click: () => {
@@ -1476,7 +1576,7 @@ function buildAppMenu() {
               .showMessageBox(mainWindow, {
                 type: 'info',
                 title: '关于',
-                message: '豆包多开管理器 v' + APP_VERSION,
+                message: '豆包多开管理器 ' + APP_VERSION_LABEL,
                 detail:
                   '数据目录: ' + USER_DIR + '\n\n' +
                   '原理: 使用 Chromium 分区会话隔离各账号,\n不修改豆包官方程序。\n\n' +
@@ -1760,7 +1860,20 @@ ipcMain.handle('accounts:select', (e, id) => { setActiveAccount(id); return true
 // 后台视图里 executeJavaScript 能跑，但 paste 事件会被吞掉。
 // 实测 5 个视图同时注入，只有当前可见的那个成功（文本 12 字符，其余全是 0）。
 let broadcastState = { running: false, abort: false };
-function sleepMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+// 支持中途取消的等待：传了 shouldAbort 就每 100ms 检查一次。
+// 原来批量发送在账号间隔里干等 gap 秒，点了停止也要等完才响应。
+function sleepMs(ms, shouldAbort) {
+  if (typeof shouldAbort !== 'function') return new Promise((r) => setTimeout(r, ms));
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (shouldAbort()) return resolve('aborted');
+      if (Date.now() - t0 >= ms) return resolve('done');
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+}
 
 // 逐张注入：每次 executeJavaScript 只带一张图。
 // 原来是把所有图的 base64 内联进一个脚本串，图一多峰值内存直接顶爆
@@ -1981,7 +2094,7 @@ ipcMain.handle('accounts:broadcast', async (e, payload) => {
         index: i, total: ids.length, id, label, phase: 'done',
         ok: !!(r && r.ok), err: (r && r.err) || ''
       });
-      if (i < ids.length - 1 && !broadcastState.abort) await sleepMs(gap);
+      if (i < ids.length - 1 && !broadcastState.abort) await sleepMs(gap, () => broadcastState.abort);
     }
   } finally {
     broadcastState.running = false;
@@ -1995,7 +2108,7 @@ ipcMain.handle('accounts:broadcast', async (e, payload) => {
         const cv = getActiveView();
         if (cv) {
           cv.setBounds(getContentBounds());
-          try { cv.setVisible(!uiModalOpen); } catch (err) {}
+          try { cv.setVisible(!isUiModalOpen()); } catch (err) {}
           const wc2 = cv.webContents;
           if (wc2 && !wc2.isDestroyed() && !wc2.isLoading() && wc2.getURL() === '') {
             wc2.loadURL(DOUBAO_URL);
@@ -2052,7 +2165,7 @@ ipcMain.handle('accounts:detect', async (e, payload) => {
         index: i, total: ids.length, id, label, phase: 'done',
         ok: !!(r && r.ok), err: (r && r.err) || ''
       });
-      if (i < ids.length - 1 && !broadcastState.abort) await sleepMs(gap);
+      if (i < ids.length - 1 && !broadcastState.abort) await sleepMs(gap, () => broadcastState.abort);
     }
   } finally {
     broadcastState.running = false;
@@ -2126,23 +2239,6 @@ function reloadAccountPage(id) {
   setTimeout(() => {
     try { wc.removeListener('did-finish-load', onLoaded); } catch (e) {}
   }, 15000);
-}
-
-async function confirmDeleteAccount(id, label) {
-  const r = await dialog.showMessageBox(mainWindow, {
-    type: 'warning',
-    buttons: ['取消', '删除'],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-    title: '删除账号',
-    message: '删除账号「' + label + '」？',
-    detail: '该账号的登录态与页面数据会一并清理，无法恢复。'
-  });
-  if (r.response !== 1) return;
-  await deleteAccountFull(id);
-  log('已删除账号: ' + label);
-  pushToRenderer('accounts:changed', loadAccounts());
 }
 
 // ---------- 内存回收 ----------
@@ -2258,6 +2354,14 @@ ipcMain.handle('prefs:get', () => prefs);ipcMain.handle('prefs:set', (e, patch) 
   savePrefs();
   return prefs;
 });
+// 设置弹窗的命名格式下拉: 模板集中放在 download-name.js, 不两边各写一份
+ipcMain.handle('download:formats', () => ({
+  options: dlName.FORMAT_OPTIONS.map(o => ({ key: o.key, label: o.label, tpl: o.tpl })),
+  placeholders: dlName.PLACEHOLDERS.slice(),
+  defaultFormat: dlName.DEFAULT_FORMAT,
+  defaultCustom: dlName.DEFAULT_CUSTOM
+}));
+
 ipcMain.handle('downloads:openFolder', () => {
   openDownloadFolder();
   return true;
@@ -2311,6 +2415,10 @@ const APP_VERSION = (() => {
   try { return String(require(path.join(APP_DIR, 'package.json')).version || '0.0.0'); }
   catch (e) { return '0.0.0'; }
 })();
+// 不再手写版本字符串 —— 4.2.4 就是忘了改这行，把「开发版v4.2.4」带进了发布包。
+// 现在靠 app.isPackaged 运行时判断：打包后显示 v4.2.4，源码里跑才显示「开发版v4.2.4」。
+// 这样发版时只需要改 package.json 一处，也不会再需要打包脚本去删代码。
+const APP_VERSION_LABEL = (app.isPackaged ? 'v' : '开发版v') + APP_VERSION;
 const UPDATE_DIR = path.join(USER_DIR, '_update');
 // 兜底更新源: 仓库的 Releases(latest)。未在设置里填自定义地址时用它。
 const GH_REPO = 'jianbingdev/doubao-multi-open';
@@ -2892,7 +3000,7 @@ function restoreUpdateState() {
 
 ipcMain.handle('app:info', () => ({
   version: APP_VERSION,
-  versionLabel: 'v' + APP_VERSION,
+  versionLabel: APP_VERSION_LABEL,
   packaged: app.isPackaged,
   dataDir: USER_DIR,
   updateUrl: prefs.updateUrl || ''
@@ -2909,10 +3017,10 @@ ipcMain.handle('update:setSource', (e, url) => {
   return { ok: true, updateUrl: prefs.updateUrl, effectiveUrl: eff };
 });
 // 界面弹窗开/关时调用: 弹窗期间隐藏账号视图, 否则原生视图会盖住 DOM 弹窗
-ipcMain.handle('ui:modal', (e, open) => {
-  uiModalOpen = !!open;
+ipcMain.handle('ui:modal', (e, open, uiModalId) => {
+  setUiModal(uiModalId, !!open);
   applyViewVisibility();
-  return { ok: true, open: uiModalOpen };
+  return { ok: true, open: isUiModalOpen() };
 });
 
 

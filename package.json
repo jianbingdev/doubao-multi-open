@@ -1,7 +1,7 @@
 {
   "name": "doubao-multi-open",
   "productName": "doubao-multi-open",
-  "version": "4.2.4",
+  "version": "4.2.5",
   "description": "豆包多账号管理器 - 视图池架构 · 单窗口毫秒级切号",
   "author": "杂粮煎饼",
   "main": "main.js",
@@ -11,7 +11,11 @@
     "url": "https://github.com/jianbingdev/doubao-multi-open.git"
   },
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node tests/boot-check.js && node tests/download-name.test.js && node tests/download-flow.test.js"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   },
   "devDependencies": {
     "electron": "^43.4.1",
