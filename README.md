@@ -1,6 +1,6 @@
 # 豆包多开管理器
 
-![version](https://img.shields.io/badge/version-4.2.4-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
+![version](https://img.shields.io/badge/version-4.2.6-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
 
 **一个窗口，管住所有豆包账号。**
 

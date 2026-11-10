@@ -2521,7 +2521,11 @@ const UPDATE_SCRIPT = [
   // 关 PS 窗口、甚至 PS 整个退掉，都不会影响新程序。
   '  $argLine = ""',
   '  try { if (-not [string]::IsNullOrWhiteSpace($cfg.launchArgs)) { $argLine = " " + $cfg.launchArgs } } catch {}',
-  '  $launchCmd = "start \"\" \"" + $cfg.exe + "\"" + $argLine',
+  // PowerShell 的转义符是反引号，不是反斜杠。以前用 \" 拼双引号，
+  // JS 求值后引号配对错乱，+ $cfg.exe + 落进字符串里，$cfg 被插值成对象字符串，
+  // start 收到乱码 → 「Windows 找不到文件」→ 自动重启失败（2026-11-10 实测）。
+  // 改成单引号字符串 + -f 格式化：单引号不插值、双引号是字面量，没有转义歧义。
+  "  $launchCmd = 'start \"\" \"{0}\"{1}' -f $cfg.exe, $argLine",
   '  Write-Log ("launch: " + $launchCmd)',
   '  $p = Start-Process -FilePath "cmd.exe" -ArgumentList ("/c " + $launchCmd) -WindowStyle Hidden -PassThru',
   '  if ($p) { $null = $p.WaitForExit(3000) }',
