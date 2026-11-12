@@ -1,4 +1,6 @@
 // 预加载脚本: 暴露类型安全的 IPC 桥
+// 注意：Electron 20+ 的 sandboxed preload 不能 require 本地文件，
+// 之前在这里引入本地时间模块会让整个 preload 抛错、window.api 全没了。
 const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
@@ -6,6 +8,19 @@ contextBridge.exposeInMainWorld('api', {
   accountsAdd: () => ipcRenderer.invoke('accounts:add'),
   accountsRename: (id, label) => ipcRenderer.invoke('accounts:rename', { id, label }),
   accountsDelete: (id) => ipcRenderer.invoke('accounts:delete', id),
+  accountsDeleteMany: (ids) => ipcRenderer.invoke('accounts:deleteMany', ids),
+  accountsReorder: (ids) => ipcRenderer.invoke('accounts:reorder', ids),
+  // 聚合搜索：并发搜所有账号 / 点结果跳转；时间窗口是纯计算，直接复用同一份实现
+  searchAll: (kw, opts) => ipcRenderer.invoke('search:all', kw, opts),
+  searchCacheFast: (kw, opts) => ipcRenderer.invoke('search:cacheFast', kw, opts),
+  searchJump: (p) => ipcRenderer.invoke('search:jump', p),
+  searchPlan: (kw) => ipcRenderer.invoke('search:plan', kw),
+  searchTimeWindow: (mode, from, to) => ipcRenderer.invoke('search:timeWindow', mode, from, to),
+  // 档2 本地缓存开关（默认关）：合并显示在主进程做，这里只透传开关 / 清空
+  searchCacheGet: () => ipcRenderer.invoke('search:cacheGet'),
+  searchCacheSet: (enabled) => ipcRenderer.invoke('search:cacheSet', enabled),
+  searchCacheClear: () => ipcRenderer.invoke('search:cacheClear'),
+  appMenuPopup: (x, y) => ipcRenderer.invoke('app:menuPopup', x, y),
   accountsContextMenu: (id) => ipcRenderer.invoke('accounts:contextMenu', id),
   accountsSelect: (id) => ipcRenderer.invoke('accounts:select', id),
   accountsDetectName: (id) => ipcRenderer.invoke('accounts:detectName', id),
@@ -35,6 +50,8 @@ contextBridge.exposeInMainWorld('api', {
   updateSetSource: (url) => ipcRenderer.invoke('update:setSource', url),
   // 弹窗开关: 让主进程临时隐藏账号视图, 否则原生 WebContentsView 会盖住界面弹窗
   uiModal: (open, id) => ipcRenderer.invoke('ui:modal', open, id),
+  // 侧栏宽度（拖动时每帧发，松手带 persist=true 落盘）
+  setSidebarWidth: (w, persist) => ipcRenderer.invoke('ui:sidebar', w, persist),
 
   // 主进程推送
   onAccountReady: (cb) => ipcRenderer.on('account:ready', (e, d) => cb(d)),
@@ -54,6 +71,11 @@ contextBridge.exposeInMainWorld('api', {
   onMenuBroadcast: (cb) => ipcRenderer.on('menu:broadcast', () => cb()),
   onAccountsChanged: (cb) => ipcRenderer.on('accounts:changed', () => cb()),
   onConfirmDelete: (cb) => ipcRenderer.on('accounts:confirmDelete', (e, d) => cb(d)),
+  onSearchProgress: (cb) => ipcRenderer.on('search:progress', (e, d) => cb(d)),
+  onSearchStart: (cb) => ipcRenderer.on('search:start', (e, d) => cb(d)),
+  onSearchCached: (cb) => ipcRenderer.on('search:cached', (e, d) => cb(d)),
+  onSearchPartial: (cb) => ipcRenderer.on('search:partial', (e, d) => cb(d)),
+  onSearchHighlight: (cb) => ipcRenderer.on('search:highlight', (e, d) => cb(d)),
   onToast: (cb) => ipcRenderer.on('toast', (e, msg) => cb(msg)),
   onMenuChangelog: (cb) => ipcRenderer.on('menu:changelog', () => cb())
 });

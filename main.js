@@ -18,6 +18,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const dlName = require('./download-name');   // 纯函数: 下载自动命名, 不依赖 electron
+const { reorderAccounts } = require('./account-order');   // 纯函数: 账号顺序重排(保证不丢)
+const pageSearch = require('./page-search');   // 注入豆包页面的搜索脚本 + 结果整理
+const searchCache = require('./search-cache');   // 纯函数: 聚合搜索本地缓存(档2), 不依赖 electron
 
 // v3.0.12: 打包成便携版后没有 bat 帮忙传参数, 而部分机器的 GPU 进程沙箱会被系统策略拦截
 // (表现为连续报 GPU process isn't usable 然后白屏/闪退)。在这里兜底, 双击 exe 即可启动。
@@ -112,13 +115,15 @@ log('=== v3 启动 ===');
 // userdata 里那些登录态分区也变成认不出来的孤儿。
 // 现在：写临时文件 -> 备份旧文件 -> rename 原子替换；
 // 读失败优先用备份，备份也没有就返回 fallback 但**不动原文件**。
-function atomicWriteJson(file, data) {
+function atomicWriteJson(file, data, opts) {
+  const o = opts || {};
   const tmp = file + '.tmp';
   const bak = file + '.bak';
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
-    if (fs.existsSync(file)) {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, o.compact ? 0 : 2), 'utf-8');
+    // 缓存这种可再生的数据不拷贝 .bak，省一半 IO 和盘占用；账号/配置仍保留备份
+    if (!o.noBak && fs.existsSync(file)) {
       try { fs.copyFileSync(file, bak); } catch (e) {}
     }
     fs.renameSync(tmp, file);
@@ -164,9 +169,30 @@ function loadPrefs() {
 // 早期版本把复选框插进图片容器、后来又把浮层做成 width/height:100%，都会触发。
 // 改成 0×0 容器 + 子元素 fixed 定位后，GPU 开着也正常（实测 4/4 张 CDN 图全加载）。
 // 这个开关留着是兜底：万一某些机器上仍有问题，手动设 true 即可退化成软件渲染。
-let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '', compatGpu: false, downloadRename: false, downloadRenameFormat: dlName.DEFAULT_FORMAT, downloadRenameCustom: dlName.DEFAULT_CUSTOM }, loadPrefs());
+let prefs = Object.assign({ closeToTray: true, winBounds: null, updateUrl: '', downloadDir: '', compatGpu: false, downloadRename: false, downloadRenameFormat: dlName.DEFAULT_FORMAT, downloadRenameCustom: dlName.DEFAULT_CUSTOM, sidebarWidth: 260, searchCache: false, recentSearches: [] }, loadPrefs());
+if (!Array.isArray(prefs.recentSearches)) prefs.recentSearches = [];
 function savePrefs() {
   atomicWriteJson(PREFS_FILE, prefs);
+}
+
+// 聚合搜索本地缓存（档2，默认关）。开关在 prefs.searchCache，数据单独存一个文件，
+// 不跟 prefs.json 混在一起——缓存可能几百 KB，prefs 要保持小而稳。
+const SEARCH_CACHE_FILE = path.join(USER_DIR, 'search-cache.json');
+function loadSearchCache() {
+  const store = searchCache.sanitizeStore(readJsonSafe(SEARCH_CACHE_FILE, searchCache.emptyStore(), 'search-cache'));
+  // 老版本偶发「面板没刷新，把上一个词的结果写进这个桶」。这些条目对本词就是噪声，
+  // 读盘时顺手丢掉；缓存只补字面含关键词的历史消息。
+  try {
+    const dropped = searchCache.dropNonLiteral(store);
+    if (dropped) log('缓存清理: 丢弃 ' + dropped + ' 条不含关键词的旧条目');
+  } catch (e) {}
+  return store;
+}
+function saveSearchCache(store) {
+  // 缓存可重建：不拷贝 .bak、用紧凑 JSON，并去掉冗余的 sig（读时现算）
+  atomicWriteJson(SEARCH_CACHE_FILE, searchCache.serialize(store), { noBak: true, compact: true });
+  // 兼容老版本：以前每次写都会留 .bak，这里顺手清掉，别让旧消息一直占着盘
+  try { fs.rmSync(SEARCH_CACHE_FILE + '.bak', { force: true }); } catch (e) {}
 }
 
 if (prefs.compatGpu) {
@@ -178,7 +204,10 @@ if (prefs.compatGpu) {
 // ---------- 全局常量 ----------
 const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
 const DOUBAO_URL = 'https://www.doubao.com/chat/';
-const SIDEBAR_WIDTH = 260;
+// 侧栏宽度可拖动调整：prefs.sidebarWidth 记住上次的值，主进程拿它算豆包页面的 x / 宽度
+const SIDEBAR_MIN = 168;
+const SIDEBAR_MAX = 360;
+let SIDEBAR_WIDTH = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(Number(prefs.sidebarWidth) || 260)));
 const PALETTE = ['#4F86F7', '#00B578', '#FF7D00', '#E16531', '#7261A3', '#2BA6A0', '#D22E45', '#5B8C5A'];
 
 // 登录凭证特征: 强凭证(登录后才会出现) 与 匿名/埋点 key
@@ -263,7 +292,7 @@ function applyViewVisibility() {
   } catch (e) {}
   // 兜底: 运行时不支持 View.setVisible 时, 用挂载/卸载代替
   try {
-    if (uiModalOpen) {
+    if (isUiModalOpen()) {
       mainWindow.contentView.removeChildView(v);
     } else {
       mainWindow.contentView.addChildView(v);
@@ -684,6 +713,8 @@ function setActiveAccount(id) {
   if (isUiModalOpen()) applyViewVisibility();
   prefs.lastActiveId = id;
   savePrefs();
+  // 通知渲染进程同步侧栏高亮：托盘切号、Ctrl+数字、搜索跳转都走这里
+  pushToRenderer('active:changed', { id: id });
   log('切换账号: ' + account.label + ' (池=' + viewPool.size + ')');
 
   // 兜底: 已登录但仍是默认名的账号, 切过去后给一次识别机会
@@ -753,7 +784,7 @@ async function getDoubaoCookies(accountId) {
 // 未登录访客只要在页面上做过操作(例如发消息触发图形验证码), 豆包就会下发一整套
 // sessionid / sid_tt / uid_tt / sid_guard(实测该访客分区有 21 个 cookie, 其中 8 个"强凭证")。
 // 所以改成以 passport 接口为准:
-//   真登录 -> { name:"qweqwe", user_id:7xxxxxxxxxx }
+//   真登录 -> { name:"示例昵称", user_id:7xxxxxxxxxx }
 //   访客   -> { name:"account_info_error", user_id:0 }
 async function detectAccountStatus(accountId, opts) {
   const o = opts || {};
@@ -779,7 +810,9 @@ async function detectAccountStatus(accountId, opts) {
     const r = await ses.fetch('https://www.doubao.com/passport/account/info/v2/?language=zh_cn', {
       method: 'GET',
       headers: { accept: 'application/json' },
-      credentials: 'include'
+      credentials: 'include',
+      // 网络卡住时不能让检测永远挂着，卡住 15 秒就按"不确定"处理
+      signal: AbortSignal.timeout(15000)
     });
     res.api = r.ok ? 'ok' : ('http-' + r.status);
     if (r.ok) {
@@ -974,22 +1007,33 @@ function startLoginInView() {
 
 // ---------- 保活/掉线检测(强凭证版, 每 45 秒) ----------
 function startKeepAlive() {
+  let busy = false;
   setInterval(async () => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    const accounts = loadAccounts();
-    for (const acc of accounts) {
-      // v3.0.2 修复: 这里原先对 pending 账号直接 continue。
-      // 后果是"添加后 5 分钟登录监控超时, 之后才扫码登录"的账号永远停在待登录 ——
-      // 用户已经登录了, 界面还显示未登录。现在所有账号都复查, 有强凭证就自动转正。
-      // v3.0.13: 保活也要走接口确认 —— 访客同样有强凭证 cookie。
-      // 没有凭证 cookie 的账号会在本地直接返回, 不产生任何请求。
-      const r = await detectAccountStatus(acc.id);
-      applyDetectResult(acc.id, r);
-      // v3.0.7: 套餐信息缺失或已过期时顺手补一次(接口可能比首轮轮询更晚返回)
-      const mi = memberInfo.get(acc.id);
-      if (!mi || !mi.active || (mi.endTime && mi.endTime < Date.now())) {
-        readMemberFromPage(acc.id);
-      }
+    if (busy) return;   // 上一轮没跑完就跳过，账号多时不叠加
+    busy = true;
+    try {
+      const accounts = loadAccounts();
+      let idx = 0;
+      const CONC = 4;   // 最多 4 个账号并发探测，不再串行排队
+      const worker = async () => {
+        while (idx < accounts.length) {
+          const acc = accounts[idx++];
+          try {
+            // v3.0.2/v3.0.13: 所有账号都复查（含 pending），有强凭证就自动转正
+            const r = await detectAccountStatus(acc.id);
+            applyDetectResult(acc.id, r);
+            // v3.0.7: 套餐信息缺失或已过期时顺手补一次
+            const mi = memberInfo.get(acc.id);
+            if (!mi || !mi.active || (mi.endTime && mi.endTime < Date.now())) {
+              readMemberFromPage(acc.id);
+            }
+          } catch (e) {}
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONC, accounts.length) }, worker));
+    } finally {
+      busy = false;
     }
   }, 45000);
 }
@@ -1412,6 +1456,7 @@ function createMainWindow() {
     backgroundColor: '#f5f5f7',
     title: '豆包多开管理器',
     show: false,
+    autoHideMenuBar: true,
     icon: path.join(APP_DIR, 'app.ico'),
     webPreferences: {
       preload: path.join(APP_DIR, 'preload.js'),
@@ -1477,6 +1522,29 @@ function selectByIndex(i) {
 }
 
 // ---------- 应用菜单 ----------
+function showFeedback() {
+  ShowMain();
+  const mail = 'jianbingdev@163.com';
+  const issues = 'https://github.com/' + GH_REPO + '/issues';
+  dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: '反馈',
+    message: '问题和建议都可以发给我们',
+    detail: '邮箱：' + mail + '\nGitHub：' + issues,
+    buttons: ['复制邮箱', '打开 GitHub', '关闭'],
+    defaultId: 1,
+    cancelId: 2,
+    noLink: true
+  }).then((r) => {
+    if (r.response === 0) {
+      try { clipboard.writeText(mail); } catch (e) {}
+      notifyToast('邮箱已复制：' + mail);
+    } else if (r.response === 1) {
+      try { shell.openExternal(issues); } catch (e) {}
+    }
+  }).catch(() => {});
+}
+
 function buildAppMenu() {
   const template = [
     {
@@ -1595,10 +1663,43 @@ function buildAppMenu() {
           }
         }
       ]
+    },
+    {
+      label: '反馈(&G)',
+      submenu: [
+        { label: '反馈方式…', click: () => showFeedback() },
+        { type: 'separator' },
+        {
+          label: '复制邮箱：jianbingdev@163.com',
+          click: () => {
+            try { clipboard.writeText('jianbingdev@163.com'); } catch (e) {}
+            ShowMain();
+            notifyToast('邮箱已复制：jianbingdev@163.com');
+          }
+        },
+        {
+          label: '打开 GitHub Issues',
+          click: () => {
+            try { shell.openExternal('https://github.com/' + GH_REPO + '/issues'); } catch (e) {}
+          }
+        }
+      ]
     }
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
+
+// 原生菜单栏默认隐藏，侧栏的紧凑按钮打开同一个菜单。
+// 不复制菜单动作，避免以后菜单改了、弹窗入口忘了改。
+ipcMain.handle('app:menuPopup', (e, x, y) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const menu = Menu.getApplicationMenu();
+  if (!menu) return false;
+  const px = Math.max(0, Math.round(Number(x) || 0));
+  const py = Math.max(0, Math.round(Number(y) || 0));
+  menu.popup({ window: mainWindow, x: px, y: py });
+  return true;
+});
 
 // ---------- 托盘 ----------
 function buildTray() {
@@ -1826,6 +1927,594 @@ ipcMain.handle('images:download', async (e, urls) => {
     log('图片下载整体失败: ' + ((err && err.message) || err));
     return { ok: false, error: (err && err.message) || String(err) };
   }
+});
+
+// 侧栏宽度：拖动时每帧调一次（persist 为空），松手时才落盘
+ipcMain.handle('ui:sidebar', (e, w, persist) => {
+  const width = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, Math.round(Number(w) || SIDEBAR_WIDTH)));
+  SIDEBAR_WIDTH = width;
+  if (activeAccountId && viewPool.has(activeAccountId)) {
+    try { viewPool.get(activeAccountId).setBounds(getContentBounds()); } catch (err) {}
+  }
+  if (persist) { prefs.sidebarWidth = width; savePrefs(); }
+  return width;
+});
+
+// ---------- 聚合搜索：并发搜所有账号（4.2.6 之后的新功能）----------
+// 实测：后台视图（不可见）也能搜，单账号 30~50ms 出结果，所以直接并发，不用排队。
+// 时间窗口计算放在主进程做，渲染层只取结果：sandboxed preload 不能 require 本地模块，
+// 这样能保证全项目只有 page-search.js 一份时间规则。
+ipcMain.handle('search:plan', (e, keyword) => pageSearch.planSearchQueries(keyword));
+ipcMain.handle('search:timeWindow', (e, mode, fromYm, toYm) =>
+  pageSearch.timeWindow(mode, fromYm, toYm));
+
+// 缓存完整时的快速预览：只读缓存，不碰页面。渲染层拿到后先上屏，
+// 随后仍然跑完整的 search:all（新消息照常实时补，最终用实时结果覆盖）。
+ipcMain.handle('search:cacheFast', (e, keyword, opts) => {
+  const kw = String(keyword == null ? '' : keyword).trim();
+  if (!kw || !prefs.searchCache) return null;
+  const o = opts || {};
+  const fromTs = Number.isFinite(o.fromTs) ? o.fromTs : null;
+  const list = loadAccounts().filter((a) => !a.pending);
+  if (!list.length) return null;
+  let store;
+  try { store = loadSearchCache(); } catch (err) { return null; }
+  const results = [];
+  for (const a of list) {
+    const cb = searchCache.findBucket(store, a.id, kw);
+    // 必须“所有账号”的缓存都完整覆盖当前窗口，不能只拿一个账号的缓存冒充全量。
+    if (!cb || !cb.complete) return null;
+    if (fromTs == null) {
+      if (cb.coverFrom != null) return null;
+    } else if (cb.coverFrom != null && fromTs < cb.coverFrom) {
+      return null;
+    }
+    results.push({
+      accountId: a.id, label: a.label, color: a.color || '#4F86F7',
+      ok: true, why: '', expanded: false,
+      deep: { exhausted: true, capped: false, fast: true },
+      items: searchCache.cacheOnlyItems(store, a.id, kw, [], { literal: true })
+    });
+  }
+  return { ok: true, cacheFast: true, keyword: kw, total: list.length, results: results };
+});
+
+let searchSeq = 0;
+let searchChain = Promise.resolve();
+
+// 账号级操作锁：搜索和跳转都要摸同一个豆包搜索面板，必须互斥。
+// 跳转优先：新跳转进来先取消该账号正在跑的搜索，等当前阶段退出后接管。
+const accountOps = new Map();
+function accountOp(id) {
+  let st = accountOps.get(id);
+  if (!st) {
+    st = { chain: Promise.resolve(), active: null };
+    accountOps.set(id, st);
+  }
+  return st;
+}
+async function acquireAccountOp(id, kind, preemptSearch) {
+  const st = accountOp(id);
+  if (preemptSearch && st.active && st.active.kind === 'search') st.active.cancel = true;
+  const prev = st.chain;
+  let releaseGate;
+  const gate = new Promise((r) => { releaseGate = r; });
+  st.chain = prev.then(() => gate);
+  await prev;
+  const op = {
+    kind: kind,
+    cancel: false,
+    cancelled: () => op.cancel,
+    release: () => {
+      if (st.active === op) st.active = null;
+      releaseGate();
+    }
+  };
+  st.active = op;
+  return op;
+}
+
+ipcMain.handle('search:all', async (e, keyword, opts) => {
+  const kw = String(keyword == null ? '' : keyword).trim();
+  if (!kw) return { ok: false, why: 'empty', total: 0, results: [] };
+  // 搜索也串行：用户快速换词时，旧搜索可能还在某个账号上翻页/等面板，
+  // 新搜索直接进去会把输入框和结果列表搅在一起（实测 stale / wrong-input，
+  // 账号整组读不出来）。新搜索先把旧搜索标记为过期，旧的在阶段间立刻收手，
+  // 等它退出后再开始，避免两个搜索同时操作同一个视图。
+  const seq = ++searchSeq;
+  const prev = searchChain;
+  let releaseSearch;
+  searchChain = new Promise((r) => { releaseSearch = r; });
+  const stale = () => seq !== searchSeq;
+  await prev;
+  try {
+    if (stale()) return { ok: false, why: 'superseded', total: 0, results: [] };
+    const o = opts || {};
+  const fromTs = Number.isFinite(o.fromTs) ? o.fromTs : null;
+  const list = loadAccounts().filter((a) => !a.pending);
+  const total = list.length;
+  // 先把账号清单推下去：渲染层据此预建所有分组，避免先到的账号独占画面
+  pushToRenderer('search:start', {
+    keyword: kw,
+    total: total,
+    accounts: list.map((a) => ({ accountId: a.id, label: a.label, color: a.color || '#4F86F7' }))
+  });
+  pushToRenderer('search:progress', { done: 0, total: total });
+
+  // 档2 缓存先行：搜索一开始就把「这个词」的缓存结果推下去，重搜秒出内容（标「缓存」）。
+  // 随后实时结果边搜边覆盖/补充，实时永远优先——新消息仍然来自实时，不受影响。
+  let seedStore = null;   // 本轮开始时的缓存快照：首屏预读 + 缓存续搜的覆盖判断都用它
+  if (prefs.searchCache) {
+    try {
+      seedStore = loadSearchCache();
+      const seed = [];
+      for (const a of list) {
+        const items = searchCache.cacheOnlyItems(seedStore, a.id, kw, [], { literal: true });
+        if (items.length) seed.push({ accountId: a.id, label: a.label, color: a.color || '#4F86F7', items: items });
+      }
+      if (seed.length) pushToRenderer('search:cached', { keyword: kw, accounts: seed });
+    } catch (err) {
+      log('缓存预读失败（不影响搜索）: ' + ((err && err.message) || err));
+    }
+  }
+
+  const exec = async (acc, script) => {
+    const v = viewPool.get(acc.id);
+    try {
+      if (!v || !v.webContents || v.webContents.isDestroyed()) return { ok: false, why: 'no-view' };
+      return await v.webContents.executeJavaScript(script, true);
+    } catch (err) {
+      return { ok: false, why: (err && err.message) || String(err) };
+    }
+  };
+
+  // 搜到一批就推一批：渲染层不用等最慢的账号，也不用猜「加载完了没」。
+  // 每个 chunk 是该账号**当前的完整 items**，渲染层直接替换即可。
+  const pushPartial = (acc, stage, items, ok, opt) => {
+    const o = opt || {};
+    pushToRenderer('search:partial', {
+      keyword: kw,
+      accountId: acc.id,
+      label: acc.label,
+      color: acc.color || '#4F86F7',
+      total: total,
+      stage: stage,
+      items: pageSearch.normalizeItems(items),
+      ok: !!ok,
+      why: o.why || '',
+      done: !!o.done,
+      retry: !!o.retry,
+      exhausted: !!o.exhausted,
+      capped: !!o.capped
+    });
+  };
+
+  const runAccount = async (acc) => {
+    const rec = {
+      accountId: acc.id, label: acc.label, color: acc.color || '#4F86F7',
+      items: [], ok: false, why: '', expanded: false, settled: 0, r1: null, r2: null
+    };
+    const op = await acquireAccountOp(acc.id, 'search', false);
+    const dead = () => stale() || op.cancelled();
+    try {
+    if (dead()) { rec.why = 'superseded'; return rec; }
+    const r1 = await exec(acc, pageSearch.fillStage1Script(kw));
+    rec.r1 = r1;
+    if (dead()) { rec.why = 'superseded'; return rec; }
+    if (!(r1 && r1.ok)) {
+      rec.why = (r1 && r1.why) || 'stage1-failed';
+      if (rec.why === 'wrong-input') {
+        log('搜索「' + kw + '」→ ' + acc.label + ' 输入框里是 ' +
+          JSON.stringify((r1 && r1.inputVal) || '') + '，不读结果');
+      } else {
+        log('搜索「' + kw + '」→ ' + acc.label + ' 第一阶段失败: ' + rec.why +
+          (r1 && r1.total != null ? ' 结果数=' + r1.total : ''));
+      }
+      pushPartial(acc, 1, [], false, { why: rec.why, done: true });
+      return rec;
+    }
+    const first = pageSearch.mergeSearchStages(r1.base, null, false);
+    rec.items = first.items;
+    rec.ok = true;
+    pushPartial(acc, 1, first.items, true, { done: false });   // 首屏先上去
+
+    const r2 = await exec(acc, pageSearch.fillStage2Script(kw));
+    rec.r2 = r2;
+    if (dead()) { rec.why = 'superseded'; return rec; }
+    const merged = pageSearch.mergeSearchStages(r1.base, r2 && r2.msg, !!(r2 && r2.expanded));
+    rec.items = merged.items;
+    rec.expanded = merged.expanded;
+    rec.settled = (r2 && r2.settled) || 0;
+    rec.why = (r2 && r2.why) || '';
+    pushPartial(acc, 2, merged.items, true, { done: false });   // 第一页先上屏
+
+    // 缓存续搜：上次这个词已经把「当前窗口」内的历史搜全了（complete），
+    // 这次只需要在「上次最新一条」之上找新消息；一旦实时翻到那个边界，剩下的历史直接用缓存。
+    // 历史消息不会变，所以不必每次把几百条重新翻一遍。
+    let fastMaxTs = null;
+    if (seedStore) {
+      const cb = searchCache.findBucket(seedStore, acc.id, kw);
+      const covered = cb && cb.complete &&
+        (cb.coverFrom == null || (fromTs != null && fromTs >= cb.coverFrom));
+      if (covered) {
+        for (const it of cb.items) {
+          if (it.ts != null && (fastMaxTs == null || it.ts > fastMaxTs)) fastMaxTs = it.ts;
+        }
+      }
+    }
+    const lastTsOf = (arr) => {
+      if (!arr || !arr.length) return null;
+      const last = arr[arr.length - 1];
+      return pageSearch.parseMessageTime(last && last.c, Date.now());
+    };
+
+    // 阶段三：逐页加载更多。50 条只是豆包「查看全部」的第一页，
+    // 派发一次 scroll 事件就会再给 50 条。每页单独一次注入 → 每页推一批，
+    // 保持「边搜边显示」；连续三页不增长就是真的到底了。
+    //
+    // 自适应扩容：只要还在长，软截止就一直往后延；硬兜底 200 页 / 60 秒每账号。
+    // 缓存续搜：翻到「上次最新一条」之下就停，后面的历史由缓存补，不再深挖。
+    const DEEP_HARD_PAGES = 200;
+    const DEEP_HARD_MS = 60000;
+    const t0 = Date.now();
+    let deadline = t0 + 15000;
+    let stall = 0, pages = 0, crossedWindow = false, brokeErr = false, reachedCached = false;
+    let lastMsg = (r2 && Array.isArray(r2.msg)) ? r2.msg : [];
+    // 阶段二这一屏如果已经翻过了缓存边界，说明新消息都在上面，深挖一页都不用
+    if (fastMaxTs != null) {
+      const ts2 = lastTsOf(lastMsg);
+      if (ts2 != null && ts2 < fastMaxTs) reachedCached = true;
+    }
+    while (!reachedCached && pages < DEEP_HARD_PAGES && Date.now() < deadline && Date.now() - t0 < DEEP_HARD_MS && stall < 3 && !crossedWindow) {
+      if (dead()) { rec.why = 'superseded'; break; }
+      const r3 = await exec(acc, pageSearch.fillStage3Script(kw));
+      if (dead()) { rec.why = 'superseded'; break; }
+      if (!(r3 && r3.ok)) { brokeErr = true; break; }
+      pages++;
+      if (r3.grown && Array.isArray(r3.items) && r3.items.length > lastMsg.length) {
+        lastMsg = r3.items;
+        const m3 = pageSearch.mergeSearchStages(r1.base, lastMsg, true);
+        rec.items = m3.items;
+        rec.expanded = true;
+        rec.settled = lastMsg.length;
+        pushPartial(acc, 3, m3.items, true, { done: false });
+        stall = 0;
+        // 还在长：软截止往后延（最多到 60 秒硬上限），让大词真正搜到底
+        deadline = Math.max(deadline, Math.min(t0 + DEEP_HARD_MS, Date.now() + 8000));
+        // 翻到缓存边界：再往下都是上次已经存过的历史，停
+        if (fastMaxTs != null) {
+          const ts3 = lastTsOf(lastMsg);
+          if (ts3 != null && ts3 < fastMaxTs) { reachedCached = true; break; }
+        }
+        // 结果是按时间倒序的：这一页最末一条已经早于窗口起点，
+        // 后面的只会更老，可以提前收工，不必把几百条老消息都拉回来。
+        if (fromTs != null) {
+          const ts = lastTsOf(lastMsg);
+          if (ts != null && ts < fromTs) crossedWindow = true;
+        }
+      } else {
+        stall++;
+      }
+    }
+    // 缓存续搜到达边界也算「这次该拿的都拿了」
+    const exhausted = stall >= 3 || crossedWindow || reachedCached;
+    const hitLimit = pages >= DEEP_HARD_PAGES || Date.now() >= deadline || Date.now() - t0 >= DEEP_HARD_MS;
+    const capped = !exhausted && (hitLimit || brokeErr);
+    rec.deep = { pages: pages, exhausted: exhausted, capped: capped, fast: reachedCached };
+    pushPartial(acc, 3, rec.items, true, {
+      done: true, exhausted: exhausted, capped: capped
+    });
+    return rec;
+    } finally {
+      op.release();
+    }
+  };
+
+  const recs = await Promise.all(list.map(runAccount));
+  if (stale()) return { ok: false, why: 'superseded', total: 0, results: [] };
+
+  // 深度加载之后各账号条数本来就会差很多（有的 463 条、有的 120 条），
+  // 不能再拿「比别人少」当异常。只有连第一页 50 条都没读到的账号才补跑。
+  let retried = 0;
+  const laggards = recs.filter((x) => x.ok && x.settled < 20);
+  if (laggards.length) {
+    retried = laggards.length;
+    await Promise.all(laggards.map(async (rec) => {
+      const acc = list.find((a) => a.id === rec.accountId);
+      await new Promise((r) => setTimeout(r, 250));
+      const again = await exec(acc, pageSearch.fillStage2Script(kw));
+      const before = (rec.r2 && Array.isArray(rec.r2.msg)) ? rec.r2.msg.length : 0;
+      if (again && again.ok && Array.isArray(again.msg) && again.msg.length > before) {
+        const merged = pageSearch.mergeSearchStages(rec.r1.base, again.msg, !!again.expanded);
+        rec.items = merged.items;
+        rec.expanded = merged.expanded;
+        rec.settled = again.settled || 0;
+        pushPartial(acc, 2, merged.items, true, { done: true, retry: true });
+      }
+    }));
+  }
+  // 第一阶段就失败的账号（页面没就绪），用一次性脚本再试一遍
+  const failed = recs.filter((x) => !x.ok);
+  if (failed.length) {
+    await Promise.all(failed.map(async (rec) => {
+      const acc = list.find((a) => a.id === rec.accountId);
+      await new Promise((r) => setTimeout(r, 300));
+      const again = await exec(acc, pageSearch.fillSearchScript(kw));
+      if (again && again.ok) {
+        rec.items = again.items || [];
+        rec.ok = true;
+        rec.why = '';
+        rec.expanded = !!again.expanded;
+        pushPartial(acc, 2, rec.items, true, { done: true, retry: true });
+      } else {
+        log('搜索「' + kw + '」→ ' + (acc && acc.label) + ' 补搜仍失败: ' +
+          ((again && again.why) || 'unknown'));
+      }
+    }));
+  }
+  // 读到 0 条的账号也补一刀：可能是面板没触发/渲染慢，别把「有结果」误报成 0 条
+  // （实测「柜子/提示词」首发 0、复测几百条；「视频」一个账号首发 0）。
+  const emptyRecs = recs.filter((x) => x.ok && x.items.length === 0);
+  if (emptyRecs.length) {
+    retried += emptyRecs.length;
+    await Promise.all(emptyRecs.map(async (rec) => {
+      const acc = list.find((a) => a.id === rec.accountId);
+      const again = await exec(acc, pageSearch.fillSearchScript(kw));
+      if (again && again.ok && Array.isArray(again.items) && again.items.length > 0) {
+        rec.items = again.items;
+        rec.expanded = !!again.expanded;
+        rec.settled = again.items.length;
+        rec.deep = null;   // 兜底结果不保证深挖完整，缓存不标「搜全」
+        pushPartial(acc, 2, rec.items, true, { done: true, retry: true });
+      }
+    }));
+  }
+  if (stale()) return { ok: false, why: 'superseded', total: 0, results: [] };
+
+  // 保持账号原有顺序，避免并发回来的顺序乱跳
+  const order = new Map(list.map((a, i) => [a.id, i]));
+  recs.sort((a, b) => (order.get(a.accountId) || 0) - (order.get(b.accountId) || 0));
+  const out = recs.map((x) => ({
+    accountId: x.accountId,
+    label: x.label,
+    color: x.color,
+    ok: x.ok,
+    why: x.why,
+    expanded: x.expanded,
+    deep: x.deep || null,
+    items: x.ok ? pageSearch.normalizeItems(x.items) : []
+  }));
+  if (stale()) return { ok: false, why: 'superseded', total: 0, results: [] };
+  // 档2 本地缓存（默认关）：实时结果已经完整跑完，这里只做两件事——
+  // ① 把这次搜到的条目积累进缓存；② 把「这次实时没返回、但以前搜到过」的旧条目补回来。
+  // 实时条目永远在前、永远优先，新消息一定来自实时，不会出现「只有旧内容、新的不加载」。
+  let cacheAdded = 0;
+  let cacheWritten = 0;   // 本次实时结果写进缓存的唯一条数（含刷新）
+  let cacheNew = 0;       // 其中本地原来没有、真正新增的条数
+  if (prefs.searchCache) {
+    try {
+      const store = loadSearchCache();
+      searchCache.pruneAccounts(store, list.map((a) => a.id));
+      const now = Date.now();
+      for (const g of out) {
+        if (!g.ok) {
+          // 实时没读出来的账号别整组丢掉：缓存里如果有这个词的旧结果，
+          // 仍然补回来并标「缓存」，否则用户会看到「搜索中还有账号3 → 搜完消失」。
+          // 账号仍保持 ok:false，界面会同时提示「N 个账号没读出来」。
+          const only = searchCache.cacheOnlyItems(store, g.accountId, kw, g.items, { literal: true });
+          if (only.length) { g.items = g.items.concat(only); cacheAdded += only.length; }
+          continue;
+        }
+        const beforeBucket = searchCache.findBucket(store, g.accountId, kw);
+        const beforeN = beforeBucket ? beforeBucket.items.length : 0;
+        // 本次实时结果里有多少个唯一签名，就是这次「写进缓存」的条数
+        const uniq = new Set();
+        for (const it of g.items) if (it.sig) uniq.add(it.sig);
+        cacheWritten += uniq.size;
+        // 先建桶并记录「这次覆盖到哪（coverFrom）、是否搜全（complete）」，
+        // 供下次「缓存续搜」判断能不能到边界就停；随后 addItems 若因超量淘汰会把 complete 作废。
+        searchCache.addItems(store, g.accountId, kw, [], now);
+        const cb = searchCache.findBucket(store, g.accountId, kw);
+        if (cb) {
+          cb.complete = !!(g.deep && g.deep.exhausted && !g.deep.capped);
+          cb.coverFrom = (fromTs == null) ? null : fromTs;
+        }
+        // 只把字面条目写进缓存：跨词混进来的噪声、纯语义命中都不落桶
+        const literalItems = g.items.filter((it) => searchCache.isLiteralItem(it, kw));
+        searchCache.addItems(store, g.accountId, kw, literalItems, now);
+        const afterBucket = searchCache.findBucket(store, g.accountId, kw);
+        const afterN = afterBucket ? afterBucket.items.length : 0;
+        cacheNew += Math.max(0, afterN - beforeN);
+        const only = searchCache.cacheOnlyItems(store, g.accountId, kw, g.items, { literal: true });
+        if (only.length) { g.items = g.items.concat(only); cacheAdded += only.length; }
+      }
+      saveSearchCache(store);
+    } catch (err) {
+      log('搜索缓存写入失败（不影响本次结果）: ' + ((err && err.message) || err));
+    }
+  }
+  const hits = out.filter((x) => x.items.length);
+  const deepPages = recs.reduce((n, x) => n + ((x.deep && x.deep.pages) || 0), 0);
+  const deepCapped = recs.filter((x) => x.deep && x.deep.capped).length;
+  const deepFast = recs.filter((x) => x.deep && x.deep.fast).length;
+  log('聚合搜索「' + kw + '」: ' + hits.length + '/' + total + ' 个账号有结果, 共 ' +
+    out.reduce((n, x) => n + x.items.length, 0) + ' 条, 展开 ' +
+    out.filter((x) => x.expanded).length + ' 个, 深挖 ' + deepPages + ' 页' +
+    (deepCapped ? ' (到上限 ' + deepCapped + ' 个)' : '') +
+    (deepFast ? ', 缓存续搜 ' + deepFast + ' 个' : '') +
+    (retried ? ', 补搜 ' + retried + ' 个' : '') +
+    (cacheAdded ? ', 缓存补 ' + cacheAdded + ' 条' : '') +
+    (prefs.searchCache ? ', 写入缓存 ' + cacheWritten + ' 条(新增 ' + cacheNew + ')' : ''));
+  return { ok: true, keyword: kw, total: total, results: out,
+    cache: prefs.searchCache ? { written: cacheWritten, added: cacheNew } : null };
+  } finally {
+    releaseSearch();
+  }
+});
+
+// 点结果 → 切账号 → 重放「搜关键词 + 点第 N 条」→ 等高亮
+// 同一账号的跳转必须串行：用户连续点两条结果时，两条跳转会在同一个搜索面板里
+// 一个翻页、一个重新搜索，候选词和结果列表互相踩。每次跳转发一个令牌，新请求
+// 先把页面令牌改掉，旧跳转的脚本在翻页/点击前看到不一致就立刻退出（superseded）。
+let jumpSeq = 0;
+const jumpChains = new Map();          // accountId -> { latest, chain }
+ipcMain.handle('search:jump', async (e, payload) => {
+  const p = payload || {};
+  const kw = String(p.keyword == null ? '' : p.keyword).trim();
+  const index = Math.max(0, Math.floor(Number(p.index) || 0));
+  const sig = String(p.sig == null ? '' : p.sig);
+  const accountId = p.accountId;
+  if (!accountId || !kw) return { ok: false, why: 'bad-args' };
+  const acc = loadAccounts().find((a) => a.id === accountId);
+  if (!acc) return { ok: false, why: 'no-account' };
+
+  const seq = ++jumpSeq;
+  let st = jumpChains.get(accountId);
+  if (!st) { st = { latest: 0, chain: Promise.resolve() }; jumpChains.set(accountId, st); }
+  st.latest = seq;
+  const stale = () => st.latest !== seq;
+  // 新请求先改页面令牌：旧脚本可能正卡在翻页/等刷新里，不能等它自己结束。
+  try {
+    const v0 = viewPool.get(accountId);
+    if (v0 && v0.webContents && !v0.webContents.isDestroyed()) {
+      v0.webContents.executeJavaScript('window.__dbJumpToken=' + JSON.stringify(String(seq)), true).catch(() => {});
+    }
+  } catch (err) {}
+
+  const job = async () => {
+    const op = await acquireAccountOp(accountId, 'jump', true);
+    try {
+    if (stale()) return { ok: false, why: 'superseded' };
+    if (!setActiveAccount(accountId)) return { ok: false, why: 'switch-failed' };
+    const v = viewPool.get(accountId);
+    if (!v || !v.webContents || v.webContents.isDestroyed()) return { ok: false, why: 'no-view' };
+    try {
+      await v.webContents.executeJavaScript('window.__dbJumpToken=' + JSON.stringify(String(seq)), true);
+    } catch (err) {}
+    if (stale()) return { ok: false, why: 'superseded' };
+    await new Promise((r) => setTimeout(r, 300));
+    // 深结果只靠原关键词重搜时，可能只加载前几十条就找不到（误报 item-gone）。
+    // 现在一次准备 2~3 个候选词（上下文 → 去符号上下文 → 标题），谁都只看前 2 页：
+    // 前一个搜不出来 / 翻两页没找到，就自动换下一个，最后才回原词深翻兜底。
+    const runJump = async (query, idx, via, opts) => {
+      try {
+        return await v.webContents.executeJavaScript(pageSearch.fillJumpScript(query, idx, via, sig, opts), true);
+      } catch (err) {
+        // 点了结果会立刻导航，脚本 promise 常被中断，属正常
+        log('跳转脚本被导航中断: ' + err.message);
+        return { ok: true, navigated: true, by: 'nav' };
+      }
+    };
+    const attempts = pageSearch.buildJumpAttempts(kw, sig, index, p.via);
+    const CAND_BUDGET_MS = 16000;             // 候选阶段总共别超过 16 秒，剩下交给原词深翻
+    const tCand = Date.now();
+    const staleRetried = new Set();
+    let jump = null, used = attempts[attempts.length - 1];
+    for (const a of attempts) {
+      if (stale()) return { ok: false, why: 'superseded' };
+      if (a.tag !== '原词' && Date.now() - tCand > CAND_BUDGET_MS) {
+        log('候选换词已用 ' + Math.round((Date.now() - tCand) / 1000) + ' 秒，跳过剩余候选，直接回原词');
+        continue;
+      }
+      used = a;
+      const tAttempt = Date.now();
+      const opts = {
+        loose: a.loose, onlyMsg: a.onlyMsg, expandMsg: a.expandMsg, maxPages: a.maxPages,
+        deepMs: a.deepMs, waitMs: a.waitMs, time: p.time, token: String(seq)
+      };
+      jump = await runJump(a.q, a.idx, a.via, opts);
+      if (stale()) return { ok: false, why: 'superseded' };
+      // 面板偶尔关不干净 / 没刷新：同一候选强开一次再试，别直接判死
+      if (jump && jump.ok === false && (jump.why === 'stale' || jump.why === 'panel-stuck') && !staleRetried.has(a.tag)) {
+        staleRetried.add(a.tag);
+        log((a.tag === '原词' ? '原词' : '候选[' + a.tag + ']') + ' 面板没刷新(' + jump.why + ')' +
+          (jump.prevVal || jump.inputVal ? ' 输入=' + JSON.stringify(jump.inputVal || '') + ' 原值=' + JSON.stringify(jump.prevVal || '') : '') +
+          '，强开一次重试');
+        await new Promise((r) => setTimeout(r, 600));
+        if (stale()) return { ok: false, why: 'superseded' };
+        jump = await runJump(a.q, a.idx, a.via, opts);
+        if (stale()) return { ok: false, why: 'superseded' };
+      }
+      if (!(jump && jump.ok === false)) break;
+      if (a.tag !== '原词') {
+        log('候选[' + a.tag + ']「' + a.q + '」没命中(' + (jump.why || '?') + ')，' +
+          (jump.total == null ? '' : '总数=' + jump.total + '，') +
+          '翻 ' + (jump.deepPages || 0) + ' 页，用时 ' + ((Date.now() - tAttempt) / 1000).toFixed(1) + ' 秒，继续下一个');
+      }
+    }
+    if (stale()) return { ok: false, why: 'superseded' };
+    // 记清楚这一跳到底靠什么命中的：sig=按内容找到，index=退回下标（可能漂）
+    try {
+      const jj = jump || {};
+      log('跳转「' + kw + '」→ ' + (acc.label || accountId) +
+        ' idx=' + index + ' via=' + (p.via || 'all') +
+        ' 查询=' + used.tag + (used.q !== kw ? '「' + used.q + '」' : '') +
+        ' 命中=' + (jj.by || '?') + (jj.at == null ? '' : ' at=' + jj.at) +
+        (jj.total == null ? '' : ' 总数=' + jj.total) +
+        (jj.expanded ? ' 已展开' : '') +
+        ' 落点=' + (jj.landed === false ? '否' : '是') +
+        (jj.retried ? ' 补点过' : '') +
+        (jj.clickedConnected === false ? ' 节点游离' : '') +
+        (jj.navigated ? ' 已导航' : '') +
+        (jj.ok === false ? ' 失败=' + (jj.why || '?') : '') +
+        (jj.panelClosed === false ? ' 面板未收' : ''));
+    } catch (err) {}
+    // 脚本明确报失败（item-gone / no-expand / no-entry…）时，别对用户说「已跳转」。
+    // 导航中断走的是上面 catch 分支，那里算成功，不受影响。
+    const jumpOk = !(jump && jump.ok === false);
+    if (!jumpOk) {
+      return { ok: false, why: (jump && jump.why) || 'jump-failed', jump: jump, highlight: null };
+    }
+    // 高亮是锦上添花：不阻塞返回，页面加载完它自己会滚过去并描边。
+    // 结果回推渲染层，好让提示语说人话（「已定位到关键词」/「首屏没找到」）。
+    try {
+      const wc = v.webContents;
+      setTimeout(() => {
+        try {
+          if (stale()) return;
+          if (!wc || wc.isDestroyed()) return;
+          wc.executeJavaScript(pageSearch.fillHighlightScript(kw, pageSearch.highlightFragments(sig)), true)
+            .then((hr) => {
+              if (stale()) return;
+              log('高亮「' + kw + '」: ' + (hr && hr.ok
+                ? (hr.exact ? '片段命中' : '关键词命中')
+                : '没找到(' + ((hr && hr.why) || '?') + ')'));
+              pushToRenderer('search:highlight', {
+                accountId: accountId, keyword: kw,
+                ok: !!(hr && hr.ok), exact: !!(hr && hr.exact), why: (hr && hr.why) || ''
+              });
+            })
+            .catch(() => {});
+        } catch (err) {}
+      }, 700);
+    } catch (err) {}
+    return { ok: true, jump: jump, highlight: null };
+    } finally {
+      op.release();
+    }
+  };
+  const run = st.chain.then(job, job);
+  st.chain = run.then(() => {}, () => {});
+  return run;
+});
+
+// 档2 缓存开关：读状态 / 开关 / 清空。合并显示在 search:all 里做，渲染层不直接读缓存。
+ipcMain.handle('search:cacheGet', () => ({
+  enabled: !!prefs.searchCache,
+  stats: searchCache.stats(loadSearchCache())
+}));
+ipcMain.handle('search:cacheSet', (e, enabled) => {
+  prefs.searchCache = !!enabled;
+  savePrefs();
+  // 关掉只是不再积累 / 补充，盘上数据留着，重新打开还能用；要彻底删走 cacheClear
+  return { enabled: prefs.searchCache, stats: searchCache.stats(loadSearchCache()) };
+});
+ipcMain.handle('search:cacheClear', () => {
+  saveSearchCache(searchCache.emptyStore());
+  // 清空要真清：原子写入会留一份 .bak 备份，不删等于旧消息还躺在盘上
+  try { fs.rmSync(SEARCH_CACHE_FILE + '.bak', { force: true }); } catch (e) {}
+  try { fs.rmSync(SEARCH_CACHE_FILE + '.tmp', { force: true }); } catch (e) {}
+  return { ok: true, stats: { buckets: 0, items: 0 } };
 });
 
 ipcMain.handle('accounts:list', () => {
@@ -2206,6 +2895,33 @@ async function deleteAccountFull(id) {
 }
 
 ipcMain.handle('accounts:delete', async (e, id) => deleteAccountFull(id));
+
+// 批量删除（侧栏管理态用）：逐个走同一套清理，单个失败不影响其它
+ipcMain.handle('accounts:deleteMany', async (e, ids) => {
+  const list = (Array.isArray(ids) ? ids : []).filter(Boolean);
+  let ok = 0;
+  for (const id of list) {
+    try { await deleteAccountFull(id); ok++; }
+    catch (err) { log('批量删除失败 ' + id + ': ' + err.message); }
+  }
+  log('批量删除账号: 成功 ' + ok + '/' + list.length);
+  return { ok, total: list.length, ids: list };
+});
+
+// 拖动排序：只改 accounts.json 的数组顺序，不动会话/视图池/登录态
+ipcMain.handle('accounts:reorder', (e, ids) => {
+  const before = loadAccounts();
+  const after = reorderAccounts(before, ids);
+  // 双保险：纯函数本身不丢账号，这里再挡一次「数量变了就不保存」
+  if (after.length !== before.length) {
+    log('[!] 顺序重排后数量变化 ' + before.length + ' -> ' + after.length + '，已放弃本次保存');
+    return { ok: false, ids: before.map((a) => a.id) };
+  }
+  saveAccounts(after);
+  pushToRenderer('accounts:changed');
+  log('账号顺序已调整: ' + after.map((a) => a.label).join(' > '));
+  return { ok: true, ids: after.map((a) => a.id) };
+});
 
 // ---------- 账号右键菜单：刷新页面 / 刷新账号 / 删除 ----------
 // 左下角 toast（渲染进程统一渲染）
@@ -2753,6 +3469,7 @@ function downloadUpdate() {
   log('开始下载更新: ' + m.url);
 
   return new Promise((resolve, reject) => {
+    const STALL_MS = 30000;   // 连不上 / 卡流超过 30 秒就判失败，别让 downloading 永远挂着
     let req;
     try {
       req = net.request({ method: 'GET', url: m.url, redirect: 'follow' });
@@ -2762,16 +3479,24 @@ function downloadUpdate() {
     }
     req.setHeader('User-Agent', 'doubao-multi-open/' + APP_VERSION);
     let settled = false;
+    let lastDataAt = Date.now();
+    let watchdog = null;
     let ws = null;   // 写入流提到外层: 失败时要能关掉, 否则 Windows 上句柄不释放,
                      // 紧接着的 clearCachedPackage() 会删不掉半截的 package.zip
     const fail = (err) => {
       if (settled) return;
       settled = true;
       updateState.downloading = false;
+      if (watchdog) { clearInterval(watchdog); watchdog = null; }
       try { req.abort(); } catch (e) {}
       if (ws) { try { ws.destroy(); } catch (e) {} }
       reject(err instanceof Error ? err : new Error(String(err)));
     };
+    watchdog = setInterval(() => {
+      if (!settled && Date.now() - lastDataAt > STALL_MS) {
+        fail(new Error('下载停滞超过 30 秒，请检查网络后重试'));
+      }
+    }, 5000);
 
     req.on('response', (res) => {
       if (res.statusCode >= 400) {
@@ -2784,6 +3509,7 @@ function downloadUpdate() {
 
       res.on('data', (chunk) => {
         got += chunk.length;
+        lastDataAt = Date.now();
         const now = Date.now();
         if (now - lastPush > 120) {
           lastPush = now;
@@ -2810,6 +3536,7 @@ function downloadUpdate() {
         }
         settled = true;
         updateState.downloading = false;
+        if (watchdog) { clearInterval(watchdog); watchdog = null; }
         updateState.zipFile = file;
         try {
           fs.writeFileSync(path.join(UPDATE_DIR, 'manifest.json'),

@@ -5,9 +5,23 @@ const btnCheckAll = document.getElementById('btnCheckAll');
 const mainTip = document.getElementById('mainTip');
 const chkTray = document.getElementById('chkTray'); // v4.2 起已挪到设置弹窗(setCloseExit)
 const toastWrap = document.getElementById('toastWrap');
+const btnManage = document.getElementById('btnManage');
+const mgrAll = document.getElementById('mgrAll');
+const mgrDel = document.getElementById('mgrDel');
+const sidebarEl = document.getElementById('sidebar');
+const sidebarResizer = document.getElementById('sidebarResizer');
+const sidebarTitle = document.querySelector('.sidebar-header h1');
+const btnSearchText = document.getElementById('btnSearchText');
+const SIDEBAR_MIN = 168;
+const SIDEBAR_MAX = 360;
+const SIDEBAR_WIDE = 215;          // 宽度低于这个值就换简称（标题和按钮同一个阈值）
+const TITLE_FULL = '豆包多开管理器';
+const TITLE_SHORT = '豆包多开';
 
 let accounts = [];
 let currentId = null;
+let managing = false;                 // 侧栏管理态：多选删除 + 拖动排序
+const selectedIds = new Set();
 
 const BADGE_TEXT = {
   online: '在线',
@@ -35,11 +49,30 @@ function render() {
   listEl.innerHTML = '';
   accounts.forEach((acc, idx) => {
     const item = document.createElement('div');
-    item.className = 'account-item' + (acc.id === currentId ? ' active' : '');
+    item.className = 'account-item'
+      + (acc.id === currentId ? ' active' : '')
+      + (managing ? ' mgr' : '')
+      + (managing && selectedIds.has(acc.id) ? ' selected' : '');
     item.dataset.badge = acc.badge || 'online';
     if (acc.busy) item.dataset.busy = '1';
     if (acc.done) item.dataset.done = '1';
-    item.title = 'Ctrl+' + (idx + 1) + ' 可快速切换 · 双击名称改名' + (acc.done ? ' · 该账号对话已完成' : '');
+    item.title = managing
+      ? '拖动可调整顺序 · 点击勾选'
+      : 'Ctrl+' + (idx + 1) + ' 可快速切换 · 双击名称改名' + (acc.done ? ' · 该账号对话已完成' : '');
+
+    if (managing) {
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'mgr-check';
+      cb.checked = selectedIds.has(acc.id);
+      cb.addEventListener('click', (e) => e.stopPropagation());
+      cb.addEventListener('change', () => {
+        if (cb.checked) selectedIds.add(acc.id); else selectedIds.delete(acc.id);
+        item.classList.toggle('selected', cb.checked);
+        syncMgrBar();
+      });
+      item.appendChild(cb);
+    }
 
     const avatar = document.createElement('div');
     avatar.className = 'avatar';
@@ -50,6 +83,7 @@ function render() {
     span.textContent = (idx + 1) + '. ' + acc.label;
     span.title = '双击可就地编辑名称';
     span.ondblclick = (e) => {
+      if (managing) return;                 // 管理态下双击留给勾选/拖动
       e.stopPropagation();
       e.preventDefault();
       startInlineEdit(span, acc);
@@ -91,19 +125,249 @@ function render() {
     }
     item.appendChild(badge);
     // 右键菜单：刷新页面 / 刷新账号 / 删除（删除有二次确认）
-    item.oncontextmenu = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      window.api.accountsContextMenu(acc.id);
-    };
-    item.onclick = () => {
-      if (editing) return;
-      if (currentId === acc.id) return; // 重复点同一个账号不重绘(双击改名的前提)
-      selectAccount(acc.id);
-    };
+    if (managing) {
+      item.oncontextmenu = (e) => { e.preventDefault(); };   // 管理态不弹右键菜单
+      item.onclick = () => {
+        const cb = item.querySelector('.mgr-check');
+        if (!cb) return;
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event('change'));
+      };
+      bindDrag(item, acc);
+    } else {
+      item.oncontextmenu = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        window.api.accountsContextMenu(acc.id);
+      };
+      item.onclick = () => {
+        if (editing) return;
+        if (currentId === acc.id) return; // 重复点同一个账号不重绘(双击改名的前提)
+        selectAccount(acc.id);
+      };
+    }
     listEl.appendChild(item);
   });
 }
+
+// ---- 侧栏宽度：拖动调整 + 文案自适应 ----
+// 窄了就换简称，保证文字不被截成半句。
+// 阈值 215：再窄「＋ 添加账号（在右侧页面直接扫码）」和「⟳ 检测账号」就挤了。
+// 真正把文案写进去（不带过渡）。narrow 是唯一依据，managing 只影响主按钮。
+function writeSidebarText(narrow, tight) {
+  narrowNow = narrow;
+  tightNow = tight;
+  // 窄态给 body 打个标记：标题降一号字，保证「豆包多开」+ 版本号一行放得下
+  if (narrow) document.body.dataset.sidebarNarrow = '1';
+  else delete document.body.dataset.sidebarNarrow;
+  if (tight) document.body.dataset.sidebarTight = '1';
+  else delete document.body.dataset.sidebarTight;
+  // 拖到最小宽度：标题拆成两行「豆包 / 多开」，不显示省略号；其他宽度保持原逻辑。
+  if (sidebarTitle) {
+    if (tight) {
+      sidebarTitle.classList.add('is-two-line');
+      sidebarTitle.innerHTML = '<span class="title-line">豆包</span><span class="title-line">多开</span>';
+    } else {
+      sidebarTitle.classList.remove('is-two-line');
+      sidebarTitle.textContent = narrow ? TITLE_SHORT : TITLE_FULL;
+    }
+  }
+  if (btnAdd) {
+    btnAdd.textContent = managing
+      ? (narrow ? '✓ 完成' : '✓ 完成（退出管理）')
+      : (narrow ? '＋ 添加账号' : '＋ 添加账号（在右侧页面直接扫码）');
+  }
+  if (btnCheckAll) btnCheckAll.textContent = narrow ? '⟳ 检测' : '⟳ 检测账号';
+  if (btnSearchText) btnSearchText.textContent = narrow ? '搜索消息' : '搜索所有账号消息';
+}
+
+// 跨阈值时别硬切：先淡下去 → 换文案 → 淡回来（CSS 的 .switching-text 负责淡）。
+// 两次切换间隔太短（快速来回拖）就直接换，不然会闪个不停。
+let narrowNow = null;
+let tightNow = null;
+let lastSwitchAt = 0;
+let switchTimer = null;
+
+function applySidebarText(w, opts) {
+  const width = Number(w);
+  const narrow = width < SIDEBAR_WIDE;
+  const tight = width <= SIDEBAR_MIN;
+  const instant = !!(opts && opts.instant);
+  if (instant) {
+    clearTimeout(switchTimer);
+    document.body.classList.remove('switching-text');
+    writeSidebarText(narrow, tight);
+    return;
+  }
+  if (narrow === narrowNow && tight === tightNow) return;   // 状态没变：拖动时绝大多数帧走这里
+  const now = Date.now();
+  if (now - lastSwitchAt < 260) {              // 快速来回拖，直接换，不做动画
+    writeSidebarText(narrow, tight);
+    return;
+  }
+  lastSwitchAt = now;
+  clearTimeout(switchTimer);
+  document.body.classList.add('switching-text');
+  switchTimer = setTimeout(() => {
+    writeSidebarText(narrow, tight);
+    requestAnimationFrame(() => document.body.classList.remove('switching-text'));
+  }, 110);
+}
+
+function setSidebarWidth(w, notify, instant) {
+  const width = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, Math.round(Number(w) || 0)));
+  if (sidebarEl) sidebarEl.style.width = width + 'px';
+  applySidebarText(width, { instant: instant });
+  if (notify) {
+    try { api.setSidebarWidth(width); } catch (e) {}
+  }
+  return width;
+}
+
+(function initSidebarResize() {
+  if (!sidebarEl || !sidebarResizer) return;
+  let dragging = false;
+  let startX = 0;
+  let startW = 0;
+  sidebarResizer.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startW = sidebarEl.offsetWidth;
+    document.body.classList.add('resizing');
+    try { sidebarResizer.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  });
+  sidebarResizer.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    setSidebarWidth(startW + (e.clientX - startX), true);
+  });
+  const stop = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('resizing');
+    try { sidebarResizer.releasePointerCapture(e.pointerId); } catch (err) {}
+    // 松手才落盘（拖动过程只在内存里改，避免每帧写 prefs.json）
+    try { api.setSidebarWidth(sidebarEl.offsetWidth, true); } catch (err) {}
+  };
+  sidebarResizer.addEventListener('pointerup', stop);
+  sidebarResizer.addEventListener('pointercancel', stop);
+})();
+
+// 启动时套用上次拖的宽度
+(async () => {
+  try {
+    const p = await api.prefsGet();
+    if (p && p.sidebarWidth) setSidebarWidth(p.sidebarWidth, false, true);
+  } catch (e) {}
+})();
+
+// ---- 侧栏管理态：多选删除 + 拖动排序 ----
+let draggingId = null;
+
+function clearDropMarks() {
+  listEl.querySelectorAll('.drop-before, .drop-after').forEach((el) => {
+    el.classList.remove('drop-before', 'drop-after');
+  });
+}
+
+// 整项 draggable：浏览器规范里拖拽手势结束后不会派发 click，
+// 所以「拖动排序」和「点击整行勾选」可以共存，不用额外加手柄。
+function bindDrag(item, acc) {
+  item.draggable = true;
+  item.addEventListener('dragstart', (e) => {
+    draggingId = acc.id;
+    item.classList.add('dragging');
+    try {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(acc.id));
+    } catch (err) {}
+  });
+  item.addEventListener('dragend', () => {
+    item.classList.remove('dragging');
+    draggingId = null;
+    clearDropMarks();
+  });
+  item.addEventListener('dragover', (e) => {
+    if (!draggingId || draggingId === acc.id) return;
+    e.preventDefault();
+    try { e.dataTransfer.dropEffect = 'move'; } catch (err) {}
+    const r = item.getBoundingClientRect();
+    const after = (e.clientY - r.top) > r.height / 2;
+    clearDropMarks();
+    item.classList.add(after ? 'drop-after' : 'drop-before');
+  });
+  item.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const src = draggingId;
+    const r = item.getBoundingClientRect();
+    const after = (e.clientY - r.top) > r.height / 2;
+    clearDropMarks();
+    draggingId = null;
+    if (!src || src === acc.id) return;
+    const ids = accounts.map((a) => a.id);
+    const from = ids.indexOf(src);
+    if (from < 0) return;
+    ids.splice(from, 1);
+    const to = ids.indexOf(acc.id);
+    if (to < 0) return;
+    ids.splice(to + (after ? 1 : 0), 0, src);
+    try {
+      await window.api.accountsReorder(ids);
+      await refresh();
+    } catch (err) {
+      toast('调整顺序失败：' + (err && err.message ? err.message : err));
+    }
+  });
+}
+
+function syncMgrBar() {
+  // 删掉的账号自动从选中集合里剔除，避免「删除 3」里含已不存在的号
+  for (const id of Array.from(selectedIds)) {
+    if (!accounts.some((a) => a.id === id)) selectedIds.delete(id);
+  }
+  const total = accounts.length;
+  const n = selectedIds.size;
+  if (mgrDel) {
+    mgrDel.textContent = n > 0 ? '删除 ' + n : '删除';
+    mgrDel.disabled = n === 0;
+  }
+  if (mgrAll) {
+    mgrAll.textContent = (total > 0 && n === total) ? '取消全选' : '全选';
+    mgrAll.disabled = total === 0;
+  }
+}
+
+function setManaging(on) {
+  managing = !!on;
+  selectedIds.clear();
+  // 关键：不隐藏整行，只把「添加账号」这个整宽主按钮换成「完成」
+  // （原来是把添加按钮整行藏掉，管理态少了 40 多像素，页面会往上跳一格）
+  if (btnAdd) btnAdd.classList.toggle('is-manage', managing);
+  applySidebarText(sidebarEl ? sidebarEl.offsetWidth : 260, { instant: true });
+  if (btnCheckAll) btnCheckAll.hidden = managing;
+  if (btnManage) btnManage.hidden = managing;
+  if (mgrAll) mgrAll.hidden = !managing;
+  if (mgrDel) mgrDel.hidden = !managing;
+  if (managing) mainTip.style.display = 'none';
+  render();
+  syncMgrBar();
+}
+
+if (btnManage) btnManage.onclick = () => setManaging(!managing);
+if (mgrAll) mgrAll.onclick = () => {
+  if (accounts.length === 0) return;
+  if (selectedIds.size === accounts.length) selectedIds.clear();
+  else accounts.forEach((a) => selectedIds.add(a.id));
+  render();
+  syncMgrBar();
+};
+if (mgrDel) mgrDel.onclick = () => {
+  const ids = Array.from(selectedIds);
+  if (!ids.length) return;
+  const one = ids.length === 1 ? accounts.find((a) => a.id === ids[0]) : null;
+  openDeleteConfirm(ids, one ? one.label : '');
+};
 
 async function selectAccount(id) {
   currentId = id;
@@ -113,6 +377,7 @@ async function selectAccount(id) {
 }
 
 btnAdd.onclick = async () => {
+  if (managing) { setManaging(false); return; }   // 管理态下这个按钮是「完成」
   btnAdd.disabled = true;
   try {
     const acc = await window.api.accountsAdd();
@@ -415,7 +680,7 @@ function renderRenamePreview() {
     tpl = hit ? hit.tpl : '';
   }
   const demo = {
-    '{账号}': '账号3', '{日期}': '2026-11-10', '{点日期}': '2026.11.10',
+    '{账号}': '示例账号', '{日期}': '2026-11-10', '{点日期}': '2026.11.10',
     '{时间}': '10.11.13', '{文件名}': '奶白色钢制衣柜视频制作方案.mp4'
   };
   let s = String(tpl || '').trim();
@@ -670,12 +935,25 @@ updAction.onclick = () => {
   if (updPhase === 'idle' || updPhase === 'none') return runCheck();
 };
 btnUpdate.onclick = openUpdateModal;
+
+// 原生菜单栏默认隐藏；侧栏的紧凑按钮打开同一套菜单，动作和快捷键不变。
+const btnAppMenu = document.getElementById('btnAppMenu');
+if (btnAppMenu) {
+  btnAppMenu.onclick = async () => {
+    const r = btnAppMenu.getBoundingClientRect();
+    try {
+      if (api.appMenuPopup) await api.appMenuPopup(r.left, r.bottom);
+    } catch (e) {}
+  };
+}
 updClose.onclick = closeUpdateModal;
 // 两个弹窗都只认右上角的 ×: 点弹窗外面、按 Esc 都不再关窗。
 // 原来点外面一下就关, 更新弹窗里正在下载的进度说没就没, 误触代价太大。
 // Enter 仍然走更新弹窗的主按钮(立即更新·重启并更新)。
 
 // ============ 删除账号二次确认（HTML 弹窗，原生 dialog 改不了样式）============
+// 单个 / 批量共用同一套确认框：传 id 数组进来就行
+let openDeleteConfirm = () => {};
 (function initDeleteConfirm() {
   const mask = document.getElementById('delMask');
   if (!mask) return;
@@ -683,49 +961,835 @@ updClose.onclick = closeUpdateModal;
   const okBtn = document.getElementById('delOk');
   const cancelBtn = document.getElementById('delCancel');
   const closeBtn = document.getElementById('delClose');
-  let pendingId = null;
+  let pendingIds = [];
 
   function close() {
     mask.hidden = true;
-    pendingId = null;
+    pendingIds = [];
     try { api.uiModal(false, 'del'); } catch (e) {}
   }
 
-  function open(id, label) {
-    pendingId = id;
-    titleEl.textContent = '删除账号「' + (label || id) + '」？';
+  function open(ids, label) {
+    pendingIds = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
+    if (!pendingIds.length) return;
+    titleEl.textContent = pendingIds.length > 1
+      ? '删除选中的 ' + pendingIds.length + ' 个账号？'
+      : '删除账号「' + (label || pendingIds[0]) + '」？';
     mask.hidden = false;
     raiseMask(mask);
     mask.focus();
     try { api.uiModal(true, 'del'); } catch (e) {}
   }
+  openDeleteConfirm = open;
 
   okBtn.addEventListener('click', async () => {
-    const id = pendingId;
-    if (!id) return close();
+    const ids = pendingIds.slice();
+    if (!ids.length) return close();
     okBtn.disabled = true;
     try {
-      await api.accountsDelete(id);
+      if (ids.length === 1) await api.accountsDelete(ids[0]);
+      else if (api.accountsDeleteMany) await api.accountsDeleteMany(ids);
+      else for (const one of ids) await api.accountsDelete(one);
     } catch (e) {
       await new Promise((r) => setTimeout(r, 300));
     }
     okBtn.disabled = false;
-    if (currentId === id) currentId = null;
+    if (ids.indexOf(currentId) >= 0) currentId = null;
     close();
-    try { refresh(); } catch (e) {}
+    // 删完自动退出管理态：避免勾选还留在界面上、手一滑又删一批（用户 2026-11-10 要求）
+    try { if (managing) setManaging(false); } catch (e) {}
+    try { await refresh(); } catch (e) {}
   });
 
   cancelBtn.addEventListener('click', close);
   closeBtn.addEventListener('click', close);
 
   if (api.onConfirmDelete) api.onConfirmDelete((d) => {
-    if (d && d.id) open(d.id, d.label);
+    if (d && d.id) open([d.id], d.label);
+  });
+})();
+
+
+// ============ 聚合搜索（一次搜所有账号的消息）============
+// 主进程并发把所有账号的豆包页面各搜一遍，这里只负责展示 + 跳转。
+(function initAggSearch() {
+  const mask = document.getElementById('searchMask');
+  if (!mask) return;
+  const input = document.getElementById('searchInput');
+  const clearBtn = document.getElementById('searchClear');
+  const reloadBtn = document.getElementById('searchReload');
+  const metaEl = document.getElementById('searchMeta');
+  const resEl = document.getElementById('searchResults');
+  const closeBtn = document.getElementById('searchClose');
+  const entry = document.getElementById('btnSearch');
+  const filtersEl = document.getElementById('searchFilters');
+  const cacheToggle = document.getElementById('searchCacheToggle');
+  const cacheHint = document.getElementById('searchCacheHint');
+  const cacheClearBtn = document.getElementById('searchCacheClear');
+  const recentEl = document.getElementById('searchRecent');
+  const cacheStatusEl = document.getElementById('searchCacheStatus');
+  const cacheBarEl = document.getElementById('searchCacheBar');
+  const cacheStatusTextEl = document.getElementById('searchCacheStatusText');
+
+  let timer = null;
+  let seq = 0;
+  let lastKw = '';              // 用户输入的原词（最近搜索/重跑用）
+  let lastSearchKw = '';        // 实际发到豆包的词（可能是去标点后的从句）
+  let lastPayload = null;      // 最近一次搜索结果，筛选时直接复用不重搜
+  let lastMs = 0;
+  let filterAcct = 'all';      // 账号筛选：all / accountId
+  let filterKind = 'all';      // 类型筛选：all / 消息 / 对话
+  let filterTime = '3m';       // 时间筛选：3m(默认) / 1m / all / custom
+  let customFrom = '', customTo = '';
+  let searchFromTs = null;     // 本轮搜索用的窗口起点（用于判断切换后要不要重搜）
+  let streamActive = false;    // 是否处在「边搜边显示」的过程中
+  let streamDone = new Set();  // 已完成（收齐全量）的账号
+  let streamT0 = 0;
+  let cacheEnabled = false;    // 档2 本地缓存开关（默认关，状态从主进程读）
+  let cacheSeed = new Map();   // 本次搜索预读的缓存条目（accountId → items，都带 fromCache）
+  let cachePreview = false;    // 当前画面是不是“缓存快速预览”，实时搜索仍会继续
+  let recentSearches = [];     // 最近搜索的词（去重、最近在前，最多 12 个）
+  let lastStats = { total: 0, cacheN: 0, capped: 0, failed: 0 };   // 最近一次 render 的缓存统计
+  let lastCacheTotal = 0;        // 缓存总条数（所有关键词，去重后）
+  let lastKeywordCacheN = null;  // 当前关键词缓存了多少条（去重后）
+  let streamRenderTimer = null;  // 流式渲染合并定时器（250ms 最多重绘一次）
+  let streamMetaText = '';       // 流式期间的 meta 文案，节流重绘后补回去
+  let lastCacheWritten = null;   // 本次搜索写进缓存的条数（含刷新）
+  let lastCacheAdded = null;     // 其中本地原来没有、新增的条数
+
+  // 时间窗口由主进程算好（sandboxed preload 不能 require 本地模块），
+  // 这里缓存结果，render() 保持同步读取；切换条件时先 sync 再用。
+  let windowCache = { from: null, to: null, label: '全部' };
+  const currentWindow = () => windowCache;
+  async function syncWindow() {
+    try { windowCache = await api.searchTimeWindow(filterTime, customFrom, customTo); }
+    catch (e) { windowCache = { from: null, to: null, label: '全部' }; }
+    return windowCache;
+  }
+  syncWindow();
+
+  // 档2 本地缓存：开关默认关。开启后主进程把搜过的存本地、下次补充旧消息，
+  // 实时搜索照跑不误（新消息永远来自实时）。这里只管开关状态 + 提示 + 清空。
+  // 缓存提示：优先显示「当前这个词缓存了多少条」，避免把「本次缓存补了几条」误当成缓存大小
+  function refreshCacheHint() {
+    if (!cacheHint) return;
+    if (!cacheEnabled) {
+      cacheHint.textContent = '默认关闭，开启后才会存到本地';
+      if (cacheClearBtn) cacheClearBtn.hidden = true;
+      if (cacheStatusEl) cacheStatusEl.hidden = true;
+      return;
+    }
+    const kw = String(lastSearchKw || lastKw || '').trim();
+    if (kw && lastKeywordCacheN != null) {
+      cacheHint.textContent = '「' + kw + '」缓存 ' + lastKeywordCacheN + ' 条 · 所有搜索 ' + lastCacheTotal + ' 条';
+    } else {
+      cacheHint.textContent = '所有搜索已存 ' + lastCacheTotal + ' 条 · 重搜同一个词会先显示缓存（标「缓存」），新消息仍实时搜';
+    }
+    if (cacheClearBtn) cacheClearBtn.hidden = !(lastCacheTotal > 0);
+  }
+  function updateCacheHint(stats) {
+    if (stats && typeof stats.items === 'number') lastCacheTotal = stats.items;
+    refreshCacheHint();
+  }
+
+  // ---------- 最近搜索（搜索框下面一排，点词重搜、点 × 删除）----------
+  function saveRecent() {
+    try { if (api.prefsSet) api.prefsSet({ recentSearches: recentSearches }); } catch (e) {}
+  }
+  function renderRecent() {
+    if (!recentEl) return;
+    if (!recentSearches.length) { recentEl.hidden = true; recentEl.innerHTML = ''; return; }
+    recentEl.hidden = false;
+    let h = '<span class="rec-label">最近</span>';
+    for (const kw of recentSearches) {
+      h += '<span class="rec-chip" data-kw="' + esc(kw) + '">' +
+        '<span class="rec-txt">' + esc(kw) + '</span>' +
+        '<span class="rec-x" title="从最近搜索里删掉">×</span></span>';
+    }
+    recentEl.innerHTML = h;
+    for (const chip of recentEl.querySelectorAll('.rec-chip')) {
+      chip.onclick = (e) => {
+        if (e.target && e.target.classList.contains('rec-x')) return;   // × 自己处理
+        if (input.value === chip.dataset.kw && lastKw === chip.dataset.kw) return;
+        input.value = chip.dataset.kw;
+        input.dispatchEvent(new Event('input'));
+      };
+      const x = chip.querySelector('.rec-x');
+      if (x) x.onclick = (e) => {
+        e.stopPropagation();
+        const k = chip.dataset.kw;
+        recentSearches = recentSearches.filter((v) => v !== k);
+        saveRecent();
+        renderRecent();
+      };
+    }
+  }
+  function pushRecent(kw) {
+    const k = String(kw == null ? '' : kw).trim();
+    if (!k) return;
+    recentSearches = [k].concat(recentSearches.filter((x) => x !== k)).slice(0, 12);
+    saveRecent();
+    renderRecent();
+  }
+  if (api.prefsGet) {
+    api.prefsGet().then((p) => {
+      recentSearches = (p && Array.isArray(p.recentSearches)) ? p.recentSearches.slice(0, 12) : [];
+      renderRecent();
+    }).catch(() => {});
+  }
+
+  // ---------- 缓存完成度：搜索中按账号进度填充，结束后报告是否「没缓存完」----------
+  function updateCacheStatus(opt) {
+    if (!cacheStatusEl) return;
+    if (!cacheEnabled) { cacheStatusEl.hidden = true; return; }
+    const o = opt || {};
+    if (!o.searching && !o.hasPayload) { cacheStatusEl.hidden = true; return; }
+    cacheStatusEl.hidden = false;
+    let pct, cls, txt;
+    if (o.searching) {
+      const done = o.done || 0, all = o.accounts || 0;
+      pct = all ? Math.min(95, Math.round((done / all) * 100)) : 8;
+      cls = '';
+      txt = '缓存中… 本次已到 ' + (o.total || 0) + ' 条 · ' + done + '/' + all + ' 个账号完成';
+    } else {
+      pct = 100;
+      if (o.capped) { cls = 'warn'; txt = '可能没缓存完：' + o.capped + ' 个账号到单次加载上限（60 秒）'; }
+      else if (o.failed) { cls = 'warn'; txt = '可能没缓存完：' + o.failed + ' 个账号没读出来'; }
+      else { cls = 'ok'; txt = '已缓存完整'; }
+      txt += ' · 本次 ' + (o.total || 0) + ' 条 · 缓存补 ' + (o.cacheN || 0) + ' 条';
+      if (o.written != null) txt += ' · 写入缓存 ' + o.written + ' 条（新增 ' + (o.added || 0) + '）';
+    }
+    cacheStatusEl.classList.toggle('warn', cls === 'warn');
+    cacheStatusEl.classList.toggle('ok', cls === 'ok');
+    if (cacheBarEl) cacheBarEl.style.width = pct + '%';
+    if (cacheStatusTextEl) {
+      cacheStatusTextEl.textContent = txt;
+      if (!cacheStatusTextEl.title) {
+        cacheStatusTextEl.title = '写入缓存 = 本次实时结果写进缓存的条数（含刷新，不受时间筛选影响）；新增 = 其中本地原来没有的条数，重搜时通常为 0';
+      }
+    }
+  }
+  function applyCacheStatus(searching, done, accounts) {
+    updateCacheStatus({
+      searching: searching, done: done, accounts: accounts,
+      total: lastStats.total, cacheN: lastStats.cacheN,
+      capped: lastStats.capped, failed: lastStats.failed, hasPayload: true,
+      written: lastCacheWritten, added: lastCacheAdded
+    });
+  }
+  if (cacheToggle && api.searchCacheGet) {
+    api.searchCacheGet().then((d) => {
+      cacheEnabled = !!(d && d.enabled);
+      cacheToggle.checked = cacheEnabled;
+      updateCacheHint(d && d.stats);
+    }).catch(() => {});
+    cacheToggle.onchange = async () => {
+      cacheEnabled = cacheToggle.checked;
+      try {
+        const d = await api.searchCacheSet(cacheEnabled);
+        updateCacheHint(d && d.stats);
+      } catch (e) {}
+      if (lastKw) run(lastKw);   // 立刻按新开关重搜一遍，开/关的效果当场可见
+    };
+  }
+  if (cacheClearBtn && api.searchCacheClear) {
+    cacheClearBtn.onclick = async () => {
+      try {
+        const d = await api.searchCacheClear();
+        updateCacheHint(d && d.stats);
+        toast('已清空搜索缓存');
+      } catch (e) {}
+      // 不要重搜：缓存开着的话重搜会把刚清掉的数据又存回去。
+      // 直接把当前列表里「缓存补回来」的行摘掉重绘，实时结果原样保留。
+      if (lastPayload) {
+        for (const g of (lastPayload.results || [])) {
+          g.items = (g.items || []).filter((it) => !it.fromCache);
+        }
+        render(lastPayload, lastSearchKw || lastKw, lastMs);
+      }
+    };
+  }
+
+  // 流式期间，还没搜完的账号结果先淡显，让用户一眼看出哪些还在涨
+  const acctPending = (id) => streamActive && !streamDone.has(id);
+
+  const esc = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+
+  // 只高亮第一处，避免长片段里满屏黄
+  function hl(text, kw) {
+    const t = String(text == null ? '' : text);
+    if (!kw) return esc(t);
+    const i = t.toLowerCase().indexOf(kw.toLowerCase());
+    if (i < 0) return esc(t);
+    return esc(t.slice(0, i)) + '<mark>' + esc(t.slice(i, i + kw.length)) + '</mark>' + esc(t.slice(i + kw.length));
+  }
+
+  function open() {
+    mask.hidden = false;
+    raiseMask(mask);
+    try { api.uiModal(true, 'search'); } catch (e) {}
+    setTimeout(() => { try { input.focus(); input.select(); } catch (e) {} }, 30);
+  }
+  function close() {
+    mask.hidden = true;
+    try { api.uiModal(false, 'search'); } catch (e) {}
+  }
+
+  // 账号 / 类型筛选条：10 个账号时先把范围收窄，不然要翻半天
+  function renderFilters(payload) {
+    if (!filtersEl) return;
+    // 预建的账号分组（0 条）也要留着，这样搜索一开始所有账号就都在画面上
+    const groups = payload.results || [];
+    if (!groups.length) { filtersEl.hidden = true; filtersEl.innerHTML = ''; return; }
+    filtersEl.hidden = false;
+
+    let total = 0, msgN = 0, talkN = 0;
+    const uniqByGroup = new Map();
+    for (const g of groups) {
+      const seen = new Set();
+      let n = 0;
+      for (const it of (g.items || [])) {
+        const key = it.sig || ('#' + it.index + '|' + it.title);
+        if (seen.has(key)) continue;   // 和列表一样按签名去重，避免筛选项数字比列表大
+        seen.add(key);
+        n++;
+        total++;
+        if (String(it.kind || '').indexOf('消息') >= 0) msgN++; else talkN++;
+      }
+      uniqByGroup.set(g.accountId, n);
+    }
+    const chip = (label, n, on, attrs) =>
+      '<button type="button" class="sf-chip' + (on ? ' on' : '') + '" ' + attrs + '>' +
+      esc(label) + (n === null ? '' : ' <span class="n">' + n + '</span>') + '</button>';
+
+    let h = '<div class="sf-row"><span class="sf-label">账号</span>';
+    h += chip('全部', total, filterAcct === 'all', 'data-a="all"');
+    for (const g of groups) {
+      h += chip(g.label, uniqByGroup.get(g.accountId) || 0, filterAcct === g.accountId, 'data-a="' + esc(g.accountId) + '"');
+    }
+    h += '</div><div class="sf-row"><span class="sf-label">类型</span>';
+    h += chip('全部', total, filterKind === 'all', 'data-k="all"');
+    h += chip('消息', msgN, filterKind === '消息', 'data-k="消息"');
+    h += chip('对话', talkN, filterKind === '对话', 'data-k="对话"');
+    h += '</div><div class="sf-row"><span class="sf-label">时间</span>';
+    h += chip('全部', null, filterTime === 'all', 'data-t="all"');
+    h += chip('近1个月', null, filterTime === '1m', 'data-t="1m"');
+    h += chip('近3个月', null, filterTime === '3m', 'data-t="3m"');
+    h += chip('自选', null, filterTime === 'custom', 'data-t="custom"');
+    if (filterTime === 'custom') {
+      h += '<input type="month" class="sf-month" id="sfFrom" value="' + esc(customFrom) + '">' +
+           '<span class="sf-label">到</span>' +
+           '<input type="month" class="sf-month" id="sfTo" value="' + esc(customTo) + '">';
+    } else {
+      h += '<span class="sf-hint">当前：' + esc(currentWindow().label) + '</span>';
+    }
+    h += '</div>';
+    filtersEl.innerHTML = h;
+
+    for (const b of filtersEl.querySelectorAll('.sf-chip')) {
+      b.onclick = async () => {
+        if (b.dataset.t !== undefined) {
+          filterTime = b.dataset.t;
+          if (filterTime === 'custom' && !customFrom) {
+            const d = new Date();
+            const ym = (x) => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0');
+            customTo = ym(d);
+            d.setMonth(d.getMonth() - 6);
+            customFrom = ym(d);
+          }
+          const nw = await syncWindow();
+          renderFilters(lastPayload);
+          // 窗口变宽时，已加载的数据可能不够（深挖是按旧窗口提前收工的），重搜一遍；
+          // 变窄则纯前端过滤即可，即点即生效。
+          const wider = (nw.from == null && searchFromTs != null) ||
+                        (nw.from != null && searchFromTs != null && nw.from < searchFromTs);
+          if (wider) run(lastKw);
+          else render(lastPayload, lastSearchKw || lastKw, lastMs);
+          return;
+        }
+        if (b.dataset.a !== undefined) filterAcct = b.dataset.a;
+        if (b.dataset.k !== undefined) filterKind = b.dataset.k;
+        renderFilters(lastPayload);
+        render(lastPayload, lastSearchKw || lastKw, lastMs);
+      };
+    }
+    for (const el of filtersEl.querySelectorAll('.sf-month')) {
+      el.onchange = () => {
+        if (el.id === 'sfFrom') customFrom = el.value;
+        else customTo = el.value;
+        renderFilters(lastPayload);
+        run(lastKw);          // 自定义区间一律重搜，可能变宽
+      };
+    }
+  }
+
+  // 流式结果会不断重排：新结果插到上面时，整个列表会往下跳，用户想点的东西就跑了。
+  // 重绘前记住「当前看的那条」，重绘后把它放回原来的屏幕位置。
+  let skipAnchor = false;
+  function itemDomKey(el) {
+    return (el.dataset.a || '') + '\u0001' + (el.dataset.i || '') + '\u0001' + (el.dataset.sig || '');
+  }
+  function captureScrollAnchor() {
+    if (!resEl) return null;
+    const boxTop = resEl.getBoundingClientRect().top;
+    let best = null, bestD = Infinity;
+    for (const el of resEl.querySelectorAll('.sr-item')) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom <= boxTop + 1) continue;
+      const d = Math.abs(r.top - boxTop);
+      if (d < bestD) { bestD = d; best = el; }
+    }
+    if (!best) return null;
+    return { key: itemDomKey(best), offset: best.getBoundingClientRect().top - boxTop };
+  }
+  function restoreScrollAnchor(anchor) {
+    if (!anchor) return;
+    const boxTop = resEl.getBoundingClientRect().top;
+    for (const el of resEl.querySelectorAll('.sr-item')) {
+      if (itemDomKey(el) !== anchor.key) continue;
+      const delta = (el.getBoundingClientRect().top - boxTop) - anchor.offset;
+      if (Math.abs(delta) > 1) resEl.scrollTop += delta;
+      return;
+    }
+  }
+
+  function render(payload, kw, ms) {
+    const anchor = skipAnchor ? null : captureScrollAnchor();
+    skipAnchor = false;
+    const k = kw.toLowerCase();
+    const win = currentWindow();
+    const filtered = (filterAcct !== 'all' || filterKind !== 'all' || filterTime !== 'all');
+    let unknownTime = 0;
+    let cacheN = 0;
+    const groups = (payload.results || [])
+      .filter((g) => filterAcct === 'all' || g.accountId === filterAcct)
+      .map((g) => {
+        const filteredItems = (g.items || []).filter((it) => {
+          // 豆包返回的本来就是命中项，而且是语义匹配：标题/片段里不一定字面含关键词。
+          // 以前在这里又按 kw 过滤一次，会把一半结果悄悄丢掉。k 只留给 hl() 做高亮。
+          if (filterKind !== 'all' && String(it.kind || '').indexOf(filterKind) < 0) return false;
+          if (win.from != null || win.to != null) {
+            if (it.ts == null) return true;   // 时间未知一律保留，去重后再计数
+            if (win.from != null && it.ts < win.from) return false;
+            if (win.to != null && it.ts > win.to) return false;
+          }
+          return true;
+        });
+        // 同一段内容会出现多条（同签名），列表只展示一条；计数也按去重后算，和缓存口径一致
+        const seen = new Set();
+        const items = [];
+        for (const it of filteredItems) {
+          const key = it.sig || ('#' + it.index + '|' + it.title);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          items.push(it);
+          if (it.ts == null) unknownTime++;
+          if (it.fromCache) cacheN++;
+        }
+        return { g: g, items: items };
+      })
+      // 还在搜的账号即使 0 条也留着占位，别让它「过一会才冒出来」
+      .filter((x) => x.items.length || acctPending(x.g.accountId));
+
+    const total = groups.reduce((n, x) => n + x.items.length, 0);
+    const failed = (payload.results || []).filter((g) => !g.ok).length;
+    const capped = (payload.results || []).filter((g) => g.deep && g.deep.capped).length;
+    lastStats = { total: total, cacheN: cacheN, capped: capped, failed: failed };
+    // 当前关键词的缓存条数 = 结果里（实时 + 缓存补差）去重后的签名数
+    let uniq = new Set();
+    for (const g of (payload.results || [])) for (const it of (g.items || [])) if (it.sig) uniq.add(it.sig);
+    lastKeywordCacheN = uniq.size;
+    if (cacheEnabled) refreshCacheHint();
+    const moreHint = capped ? ' · ' + capped + ' 个账号可能还有更多（到加载上限）' : '';
+    const timeHint = filterTime === 'all' ? '' : ' · ' + win.label;
+    const unknownHint = unknownTime ? ' · ' + unknownTime + ' 条时间未知未过滤' : '';
+    const cacheMetaHint = cacheN ? ' · 其中 ' + cacheN + ' 条来自缓存' : '';
+    if (!total && !(streamActive && groups.some((x) => acctPending(x.g.accountId)))) {
+      if (streamActive && streamDone.size < (payload.total || 0)) {
+        resEl.innerHTML = '<div class="search-empty">搜索中…</div>';
+      } else {
+        resEl.innerHTML = '<div class="search-empty">' +
+          (filtered ? '当前筛选下没有结果 —— 点上面的「全部」看看' : '没搜到「' + esc(kw) + '」') +
+          (!filtered && failed ? '<br>' + failed + ' 个账号没读出来（点右边「重新加载」再试一次）' : '') +
+          '</div>';
+      }
+      metaEl.textContent = '共 0 条 · ' + ms + ' ms' + timeHint + moreHint;
+      return;
+    }
+
+    metaEl.textContent = '共 ' + total + ' 条' + (filtered ? '（已筛选）' : '') +
+      ' · 来自 ' + groups.length + '/' + (payload.total || groups.length) +
+      ' 个账号 · ' + ms + ' ms' + timeHint + unknownHint + cacheMetaHint +
+      (failed ? ' · ' + failed + ' 个没读出来' : '') + moreHint;
+
+    let html = '';
+    for (const x of groups) {
+      const g = x.g;
+      html += '<div class="sr-group"><span class="sr-dot" style="background:' + esc(g.color || '#4F86F7') +
+        '"></span><span>' + esc(g.label) + '</span><span class="sr-count">' + x.items.length + ' 条</span></div>';
+      if (!x.items.length) {
+        html += '<div class="sr-pending">正在搜索这个账号…</div>';
+        continue;
+      }
+      for (const it of x.items) {
+        const isMsg = String(it.kind || '').indexOf('消息') >= 0;
+        html += '<div class="sr-item' + (acctPending(g.accountId) ? ' sr-loading' : '') +
+          (it.fromCache ? ' sr-from-cache' : '') +
+          '" data-a="' + esc(g.accountId) + '" data-i="' + it.index +
+          '" data-v="' + esc(it.via || 'all') + '" data-sig="' + esc(it.sig || '') +
+          '" data-time="' + esc(it.time || '') +
+          '" title="' + (it.fromCache ? '本地缓存补回的旧消息，点击尝试跳转' : '点击跳到这条消息') + '">' +
+          '<span class="sr-kind' + (isMsg ? ' msg' : '') + '">' + esc(it.kind) + '</span>' +
+          (it.fromCache ? '<span class="sr-cache" title="这次实时没加载出来，用本地缓存补的">缓存</span>' : '') +
+          '<span class="sr-acct" title="来自 ' + esc(g.label) + '"><i style="background:' +
+            esc(g.color || '#4F86F7') + '"></i>' + esc(g.label) + '</span>' +
+          '<div class="sr-body">' +
+          '<div class="sr-title">' + hl(it.title, kw) + '</div>' +
+          (it.snippet ? '<div class="sr-snippet">' + hl(it.snippet, kw) + '</div>' : '') +
+          '</div>' +
+          (it.time ? '<span class="sr-time">' + esc(it.time) + '</span>' : '') +
+          '</div>';
+      }
+    }
+    resEl.innerHTML = html;
+    for (const el of resEl.querySelectorAll('.sr-item')) {
+      el.onclick = () => jump(el.dataset.a, Number(el.dataset.i), el.dataset.v, el.dataset.sig, el.dataset.time);
+    }
+    restoreScrollAnchor(anchor);
+  }
+
+  // 流式渲染节流：大结果时不再每页全量重绘，250ms 合并一次；最终结果由 run() 立即冲刷
+  function scheduleStreamRender() {
+    if (streamRenderTimer) return;
+    streamRenderTimer = setTimeout(() => {
+      streamRenderTimer = null;
+      if (!streamActive || !lastPayload) return;
+      renderFilters(lastPayload);
+      render(lastPayload, lastSearchKw || lastKw, Date.now() - streamT0);
+      if (streamMetaText) metaEl.textContent = streamMetaText;
+    }, 250);
+  }
+  function flushStreamRender() {
+    if (streamRenderTimer) { clearTimeout(streamRenderTimer); streamRenderTimer = null; }
+  }
+
+  async function run(rawKw) {
+    const raw = String(rawKw == null ? '' : rawKw).trim();
+    if (!raw) return;
+    const mine = ++seq;
+    lastKw = raw;                 // 原词：最近搜索、缓存开关/时间筛选重跑都按它
+    let plan = [raw];
+    try {
+      const p = api.searchPlan ? await api.searchPlan(raw) : null;
+      if (Array.isArray(p) && p.length) plan = p;
+    } catch (e) {}
+    if (mine !== seq) return;
+    lastSearchKw = plan[0];
+    skipAnchor = true;          // 换词了，回到列表顶部，不要沿用上一轮的位置
+    try { resEl.scrollTop = 0; } catch (e) {}
+    pushRecent(raw);
+    lastKeywordCacheN = null;
+    refreshCacheHint();
+    flushStreamRender();
+    streamMetaText = '';
+    lastCacheWritten = null;
+    lastCacheAdded = null;
+    await syncWindow();
+    if (mine !== seq) return;
+    const win = currentWindow();
+    searchFromTs = win.from;
+    streamActive = true;
+    streamT0 = Date.now();
+    cachePreview = false;
+    metaEl.textContent = '正在搜索…';
+    resEl.innerHTML = '<div class="search-empty">搜索中…</div>';
+    let finalR = null, usedQ = plan[0];
+    for (let i = 0; i < plan.length; i++) {
+      if (mine !== seq) return;
+      usedQ = plan[i];
+      lastSearchKw = usedQ;
+      lastPayload = null;
+      cacheSeed = new Map();
+      streamDone = new Set();
+      streamMetaText = '';
+      if (i > 0) {
+        metaEl.textContent = '没搜到，换用「' + usedQ + '」再试…';
+        resEl.innerHTML = '<div class="search-empty">换用「' + esc(usedQ) + '」再试…</div>';
+      }
+      // 缓存完整时先把缓存结果立刻铺上去；下面仍然会跑完整搜索，
+      // 实时结果后来居上，失败时也还有缓存兜底。这里只是把“等搜索完成”
+      // 变成“先看到结果、后台刷新”。
+      let fast = null;
+      try {
+        if (api.searchCacheFast) fast = await api.searchCacheFast(usedQ, { fromTs: win.from });
+      } catch (e) {}
+      if (mine !== seq) return;
+      if (fast && fast.ok && fast.cacheFast && Array.isArray(fast.results)) {
+        lastPayload = { ok: true, keyword: usedQ, total: fast.total, results: fast.results };
+        cacheSeed = new Map(fast.results.map((g) => [g.accountId, g.items || []]));
+        streamActive = true;
+        streamDone = new Set();
+        cachePreview = true;
+        let cachedN = 0;
+        for (const g of fast.results) cachedN += (g.items || []).length;
+        renderFilters(lastPayload);
+        render(lastPayload, usedQ, 0);
+        // render() 会先写汇总行；缓存预览的提示放在它后面，避免被覆盖。
+        metaEl.textContent = '已显示缓存 ' + cachedN + ' 条 · 后台刷新中…';
+      }
+      let r = null;
+      try {
+        r = await api.searchAll(usedQ, { fromTs: win.from });
+      } catch (e) {
+        r = { ok: false, why: (e && e.message) || String(e) };
+      }
+      if (mine !== seq) return;               // 输入已变，丢弃旧结果
+      finalR = r;
+      const n = (r && r.ok && Array.isArray(r.results))
+        ? r.results.reduce((s, g) => s + ((g.items || []).length), 0) : 0;
+      if (n > 0 || i === plan.length - 1) break;
+    }
+    streamActive = false;
+    streamDone = new Set();
+    cachePreview = false;
+    if (finalR && finalR.ok) { filterAcct = 'all'; filterKind = 'all'; }   // 新搜索重置筛选
+    if (!finalR || !finalR.ok) {
+      resEl.innerHTML = '<div class="search-empty">搜索失败：' + esc((finalR && finalR.why) || '未知错误') + '</div>';
+      metaEl.textContent = '';
+      return;
+    }
+    lastPayload = finalR;
+    lastMs = Date.now() - streamT0;
+    lastCacheWritten = (finalR.cache && typeof finalR.cache.written === 'number') ? finalR.cache.written : null;
+    lastCacheAdded = (finalR.cache && typeof finalR.cache.added === 'number') ? finalR.cache.added : null;
+    // 搜完刷新提示里的「已存 N 条」——缓存是这次搜完才写盘的，不刷新会一直显示旧数字
+    if (cacheEnabled && api.searchCacheGet) {
+      api.searchCacheGet().then((d) => updateCacheHint(d && d.stats)).catch(() => {});
+    }
+    flushStreamRender();
+    renderFilters(finalR);
+    render(finalR, usedQ, lastMs);
+    applyCacheStatus(false);
+    if (usedQ !== raw) {
+      const note = '已按「' + usedQ + '」搜索';
+      metaEl.textContent = metaEl.textContent ? metaEl.textContent + ' · ' + note : note;
+    }
+  }
+
+  // 跳转失败的 why 说人话，别直接甩 item-gone 这种词
+  const JUMP_WHY = {
+    'item-gone': '那条结果已经不在了，重新加载再试',
+    'no-expand': '「查看全部」没展开，重新加载再试',
+    'no-item': '没搜到结果，重新加载再试',
+    'no-entry': '豆包页面没准备好，等一下再试',
+    'no-input': '豆包搜索框没出来，等一下再试',
+    'no-view': '这个账号的页面还没就绪',
+    'switch-failed': '切不到这个账号',
+    'no-account': '账号已经不存在了'
+  };
+
+  async function jump(accountId, index, via, sig, time) {
+    if (!accountId || !(lastSearchKw || lastKw)) return;
+    const kw = lastSearchKw || lastKw;
+    // 先关面板：切号在主进程做，面板留着会挡住切过去的页面
+    close();
+    toast('正在跳转…');
+    let r = null;
+    try {
+      // sig 是按内容找人的依据（下标会漂，内容不会），主进程优先用它；
+      // time 用于同标题多条消息时缩小范围
+      r = await api.searchJump({
+        accountId: accountId, keyword: kw, index: index, via: via || 'all',
+        sig: sig || '', time: time || ''
+      });
+    } catch (e) {
+      r = { ok: false, why: (e && e.message) || String(e) };
+    }
+    // 连续点结果时，旧跳转会被新请求取代；旧请求别弹「跳转失败」干扰用户。
+    if (r && r.ok === false && r.why === 'superseded') return;
+    if (r && r.ok) {
+      const j = r.jump || {};
+      // landed=false 表示点了但既没换页面、豆包也没自己收面板 —— 别假装成功
+      if (j.landed === false) toast('点了但页面没反应，再点一次试试');
+      else if (sig && j.by === 'index') toast('位置对不上，只能按顺序跳，可能不是这条');
+      else toast('已跳转到该会话');
+    } else {
+      const why = (r && r.why) || '未知错误';
+      toast('跳转失败：' + (JUMP_WHY[why] || why));
+    }
+  }
+
+  input.addEventListener('input', () => {
+    const kw = input.value.trim();
+    clearBtn.hidden = !kw;
+    if (reloadBtn) reloadBtn.hidden = !kw;
+    clearTimeout(timer);
+    if (!kw) {
+      metaEl.textContent = '';
+      resEl.innerHTML = '<div class="search-empty">输入关键词，自动搜索所有账号<br>点结果可直接跳到那条消息</div>';
+      return;
+    }
+    timer = setTimeout(() => run(kw), 320);   // 打字防抖
+  });
+
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Escape') { e.preventDefault(); close(); }
+  });
+
+  clearBtn.onclick = () => {
+    input.value = '';
+    input.dispatchEvent(new Event('input'));
+    input.focus();
+  };
+
+  // 重新加载：拿同一个关键词再搜一遍。
+  // 豆包的结果是分批回来的，偶尔只回来一部分、或者某几个账号没读出来，
+  // 给个手动补一刀的入口，比让用户删字重打省事。
+  let reloading = false;
+  async function reload() {
+    // 优先用输入框里现在的词：防抖还没跑完时 lastKw 还是上一轮的
+    const kw = input.value.trim() || lastKw;
+    if (!kw || reloading) return;
+    reloading = true;
+    if (reloadBtn) { reloadBtn.classList.add('loading'); reloadBtn.disabled = true; }
+    try {
+      await run(kw);
+    } finally {
+      reloading = false;
+      if (reloadBtn) { reloadBtn.classList.remove('loading'); reloadBtn.disabled = false; }
+    }
+  }
+  if (reloadBtn) reloadBtn.onclick = reload;
+  closeBtn.onclick = close;
+  if (entry) entry.onclick = open;
+
+  // 搜索一开始就把所有账号的分组预建出来，谁先搜完谁先涨，
+  // 不会出现「只显示一个账号、另一个过一会才冒出来」。
+  if (api.onSearchStart) api.onSearchStart((d) => {
+    if (!d || !streamActive || d.keyword !== lastSearchKw) return;
+    const accs = d.accounts || [];
+    if (!lastPayload) lastPayload = { ok: true, total: d.total || accs.length, results: [] };
+    for (const a of accs) {
+      if (!lastPayload.results.some((x) => x.accountId === a.accountId)) {
+        lastPayload.results.push({
+          accountId: a.accountId, label: a.label, color: a.color,
+          ok: true, why: '', items: [], deep: null
+        });
+      }
+    }
+    renderFilters(lastPayload);
+    render(lastPayload, lastSearchKw || lastKw, 0);
+    metaEl.textContent = cachePreview ? '缓存已显示 · 后台刷新中…' : '正在搜索 ' + accs.length + ' 个账号…';
+  });
+
+  // 缓存先行：主进程在实时搜索前先把「这个词」的缓存推下来，先上屏（标「缓存」），
+  // 实时结果随后边搜边覆盖/补充。重复搜同一个词时一打开就有内容，不用干等实时。
+  if (api.onSearchCached) api.onSearchCached((d) => {
+    if (!d || !streamActive || d.keyword !== lastSearchKw) return;
+    const accs = d.accounts || [];
+    if (!lastPayload) lastPayload = { ok: true, total: accs.length, results: [] };
+    let n = 0;
+    for (const a of accs) {
+      cacheSeed.set(a.accountId, a.items || []);
+      let g = (lastPayload.results || []).find((x) => x.accountId === a.accountId);
+      if (!g) {
+        g = { accountId: a.accountId, label: a.label, color: a.color, ok: true, why: '', items: [], deep: null };
+        lastPayload.results.push(g);
+      }
+      // 已经有的（实时先到了）不动，只补没见过的缓存条目，避免把实时结果盖掉
+      const prior = g.items || [];
+      const priorSigs = new Set(prior.map((x) => x.sig));
+      const add = (a.items || []).filter((x) => x.sig && !priorSigs.has(x.sig));
+      g.items = prior.concat(add);
+      n += add.length;
+    }
+    if (!n) return;
+    flushStreamRender();
+    renderFilters(lastPayload);
+    render(lastPayload, lastSearchKw || lastKw, 0);
+    metaEl.textContent = '先显示缓存 ' + n + ' 条 · 正在实时搜索…';
+    applyCacheStatus(true, 0, accs.length);
+  });
+
+  if (api.onSearchProgress) api.onSearchProgress((d) => {
+    if (!d || !d.total) return;
+    if (d.done >= d.total) return;             // 完成时由 render 显示汇总
+    metaEl.textContent = '正在搜索 ' + d.done + '/' + d.total + ' 个账号…';
+  });
+
+  // 边搜边显示：主进程每完成一个阶段就推一批，这里合并进 lastPayload 立刻重绘。
+  // 不预判「加载完了没」——数字还在涨就说明还在搜；全部账号 done 后由 run() 收尾。
+  if (api.onSearchPartial) api.onSearchPartial((d) => {
+    if (!d || !streamActive || d.keyword !== lastSearchKw) return;   // 旧搜索的回灌不要
+    if (!lastPayload) lastPayload = { ok: true, total: d.total || 0, results: [] };
+    let g = (lastPayload.results || []).find((x) => x.accountId === d.accountId);
+    if (!g) {
+      g = { accountId: d.accountId, label: d.label, color: d.color, ok: true, why: '', items: [], deep: null };
+      lastPayload.results.push(g);
+      // 顺序无所谓：run() 结束时主进程会推回按账号顺序排好的完整结果
+    }
+    // 实时结果永远优先；这次实时还没返回的，用预读缓存补上（标「缓存」），
+    // 免得刚上屏的缓存条目在第一批实时结果到达时整块消失。
+    const live = d.items || [];
+    const seed = cacheSeed.get(d.accountId) || [];
+    const liveSigs = new Set(live.map((x) => x.sig));
+    g.items = live.concat(seed.filter((x) => x.sig && !liveSigs.has(x.sig)));
+    g.ok = d.ok;
+    g.why = d.why || '';
+    g.deep = { exhausted: !!d.exhausted, capped: !!d.capped };
+    if (d.done) streamDone.add(d.accountId);
+    else streamDone.delete(d.accountId);
+
+    // 流式重绘节流到 250ms 一次；meta 每批都更新，保持「还在涨」的实时感
+    scheduleStreamRender();
+    if (streamDone.size < (d.total || 0)) {
+      const n = lastPayload.results.reduce((s, x) => s + (x.items || []).length, 0);
+      metaEl.textContent = '搜索中… 已到 ' + n + ' 条' +
+        (d.stage >= 3 ? ' · 继续翻页' : '') +
+        ' · ' + streamDone.size + '/' + (d.total || 0) + ' 个账号完成';
+    }
+    streamMetaText = metaEl.textContent;
+    applyCacheStatus(true, streamDone.size, d.total);
+  });
+
+  // 高亮是跳转之后异步补的，结果回来再补一句实话：
+  // 「已定位到关键词」或者「首屏没找到」—— 后者比笼统的「已跳转」有用
+  if (api.onSearchHighlight) api.onSearchHighlight((d) => {
+    if (!d || lastSearchKw !== d.keyword) return;    // 已经换词了，别乱弹
+    if (d.ok) toast(d.exact ? '已定位到那条消息' : '已定位到关键词');
+    else toast('已打开会话，但首屏没找到「' + d.keyword + '」，往上翻翻');
+  });
+
+  window.addEventListener('keydown', (e) => {
+    if (!mask.hidden) return;
+    if (e.ctrlKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+      e.preventDefault();
+      open();
+    }
   });
 })();
 
 
 // ============ 更新日志（只记新增 / 优化 / 修复）============
 const CHANGELOG = [
+  {
+    v: '4.2.7',
+    items: [
+      ['new', '聚合搜索本地缓存（默认关闭，搜索页可开）：重搜同一个词先显示缓存，只把新消息实时补进来，历史消息不重复加载'],
+      ['new', '搜索页加「最近搜索」（点词重搜、× 删除）、缓存完成度进度条，以及「本次写入缓存 N 条（新增 M）」提示'],
+      ['new', '深挖/缓存自动扩容：大词（如「视频」「1」）不再卡在固定页数，缓存也不再卡单账号 500 条'],
+      ['imp', '流式搜索结果渲染改为 250ms 合并 + 按内容去重，条数与缓存口径一致；筛选项计数同步去重'],
+      ['imp', '搜索缓存文件瘦身约 50%（不存冗余签名、不复制备份），账号保活改为并发探测'],
+      ['fix', '换词搜索偶尔读到上一个词的结果（stage1 读取、stage2 单类视图复用两处）'],
+      ['fix', '搜索有时把有结果误报成 0 条（空结果强制重开再搜 + 主进程补搜）'],
+      ['fix', '缓存条数显示口径（当前词缓存数 / 本次写入 / 新增）'],
+      ['fix', '发版打包清单漏 search-cache.js，更新后会起不来（打包脚本 + 回归测试）'],
+      ['new', '顶部菜单「帮助」后面新增「反馈」：邮箱 jianbingdev@163.com / GitHub Issues']
+    ]
+  },
   {
     v: '4.2.6',
     items: [
@@ -944,6 +2008,9 @@ refresh();
   const mask = document.getElementById('bcMask');
   if (!mask) return;
   const listEl = document.getElementById('bcList');
+  const countEl = document.getElementById('bcCount');
+  const allBtn = document.getElementById('bcAll');
+  const noneBtn = document.getElementById('bcNone');
   const textEl = document.getElementById('bcText');
   const gapEl = document.getElementById('bcGap');
   const startBtn = document.getElementById('bcStart');
@@ -960,6 +2027,31 @@ refresh();
   const esc = (t) => String(t == null ? '' : t).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ));
+
+  // 列表是两列卡片：勾选时同步高亮 + 顶部「已选 N / 共 M」
+  function syncItemState() {
+    if (!listEl) return;
+    const boxes = listEl.querySelectorAll('input[type="checkbox"]');
+    let checked = 0;
+    for (const b of boxes) {
+      const lab = b.closest('.bc-item');
+      if (lab) lab.classList.toggle('on', b.checked);
+      if (b.checked) checked++;
+    }
+    if (countEl) countEl.textContent = '已选 ' + checked + ' / 共 ' + boxes.length;
+    if (allBtn) allBtn.disabled = boxes.length === 0;
+    if (noneBtn) noneBtn.disabled = boxes.length === 0;
+  }
+  // 委托绑定：列表内容每次 open 都会重渲染，绑容器就不用重复绑
+  listEl.addEventListener('change', syncItemState);
+  if (allBtn) allBtn.onclick = () => {
+    listEl.querySelectorAll('input[type="checkbox"]').forEach((b) => { b.checked = true; });
+    syncItemState();
+  };
+  if (noneBtn) noneBtn.onclick = () => {
+    listEl.querySelectorAll('input[type="checkbox"]').forEach((b) => { b.checked = false; });
+    syncItemState();
+  };
 
   async function open() {
     if (running) return;
@@ -978,11 +2070,14 @@ refresh();
       const accounts = await api.accountsList();
       const usable = (accounts || []).filter((a) => !a.pending);
       listEl.innerHTML = usable.length
-        ? usable.map((a) => '<label class="bc-item"><input type="checkbox" value="' + esc(a.id) + '"><span>' + esc(a.label) + '</span></label>').join('')
-        : '<div style="font-size:12px;opacity:.6;padding:4px">没有已登录的账号</div>';
+        ? usable.map((a) => '<label class="bc-item" title="' + esc(a.label) + '">'
+            + '<input type="checkbox" value="' + esc(a.id) + '">'
+            + '<span>' + esc(a.label) + '</span></label>').join('')
+        : '<div class="bc-empty">没有已登录的账号</div>';
     } catch (e) {
-      listEl.innerHTML = '<div style="font-size:12px;color:#d33;padding:4px">读取账号失败</div>';
+      listEl.innerHTML = '<div class="bc-empty err">读取账号失败</div>';
     }
+    syncItemState();
     mask.hidden = false;
     raiseMask(mask);
     mask.focus();

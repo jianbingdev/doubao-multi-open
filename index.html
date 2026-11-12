@@ -16,22 +16,73 @@
       user-select: none;
     }
     .sidebar {
-      width: 260px; min-width: 260px;
+      width: 260px; min-width: 168px; max-width: 360px;
+      position: relative;
       background: #fff;
       border-right: 1px solid #e3e3e8;
       display: flex; flex-direction: column;
       height: 100vh;
     }
+    /* 右边缘拖动条：贴内侧 6px，避免被原生账号视图（WebContentsView）盖住 */
+    .sidebar-resizer {
+      position: absolute; top: 0; right: 0; width: 6px; height: 100%;
+      cursor: col-resize; z-index: 5; background: transparent;
+      transition: background .12s;
+    }
+    .sidebar-resizer:hover { background: rgba(29,99,216,.16); }
+    body.resizing { cursor: col-resize; user-select: none; }
+    body.resizing .sidebar-resizer { background: rgba(29,99,216,.3); }
     .sidebar-header { padding: 14px 14px 10px; border-bottom: 1px solid #eeeef2; }
-    .sidebar-header h1 { font-size: 15px; font-weight: 600; }
+    .sidebar-header h1 {
+      font-size: 15px; font-weight: 600; min-width: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    /* 侧栏拖窄时标题再小一号，「豆包多开」+ 版本号徽标才放得下一行 */
+    body[data-sidebar-narrow] .sidebar-header h1 { font-size: 14px; }
+    /* 拖到最小宽度：标题改成两行「豆包 / 多开」，不靠省略号硬截 */
+    .sidebar-header h1.is-two-line {
+      flex: 0 0 auto; min-width: 30px; height: 24px;
+      display: flex; flex-direction: column; align-items: flex-start;
+      white-space: normal; overflow: visible; text-overflow: clip;
+      /* 两行总高固定 24px，和右边 ☰ 按钮同高：下面的按钮/账号列表不会被顶下去 */
+      font-size: 11px; line-height: 1;
+    }
+    /* 必须比 body[data-sidebar-narrow] 的 14px 规则更具体，否则会被压回 14px 导致重叠 */
+    body[data-sidebar-tight] .sidebar-header h1.is-two-line { font-size: 11px; line-height: 1; }
+    .sidebar-header h1.is-two-line .title-line {
+      display: block; height: 12px; line-height: 12px;
+      animation: title-line-in .18s ease both;
+    }
+    .sidebar-header h1.is-two-line .title-line:nth-child(2) {
+      animation-delay: .04s;
+    }
+    body[data-sidebar-tight] .brand-row { gap: 6px; min-width: 0; }
+    @keyframes title-line-in {
+      from { opacity: 0; transform: translateY(3px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    /* 宽度跨阈值要换文案：先淡下去再换字再淡回来，别硬切 */
+    .sidebar-header h1,
+    .btn-add,
+    .side-actions .btn-check {
+      transition: opacity .14s ease;
+    }
+    body.switching-text .sidebar-header h1,
+    body.switching-text .btn-add,
+    body.switching-text .side-actions .btn-check {
+      opacity: .3;
+      transition-duration: .1s;
+    }
     .sidebar-header p { font-size: 11px; color: #86868b; margin-top: 3px; }
     .btn-add {
-      margin: 12px 14px 6px; padding: 9px 0;
+      margin: 0 14px 6px; padding: 9px 8px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       background: #1d63d8; color: #fff; border: none; border-radius: 8px;
       font-size: 13px; cursor: pointer;
     }
     .btn-add:hover { background: #174ec0; }
     .btn-add:disabled { background: #b8b8be; cursor: wait; }
+    .btn-add.is-manage { background: #1b57bd; }   /* 管理态复用这个位置，只换文案，颜色略深 */
     .btn-check {
       margin: 0 14px 8px; padding: 7px 0;
       width: calc(100% - 28px);
@@ -42,6 +93,222 @@
     }
     .btn-check:hover { background: #f2f7ff; }
     .btn-check:disabled { color: #b8b8be; border-color: #e3e3e8; background: #fafafa; cursor: wait; }
+    /* 检测 + 管理并排；管理态下隐藏添加入口、显示批量操作条 */
+    .side-actions { display: flex; gap: 6px; margin: 0 14px 8px; }
+    .side-actions .btn-check,
+    .side-actions .btn-manage {
+      flex: 1 1 0; min-width: 0; margin: 0; padding: 7px 0; width: auto;
+      display: flex; align-items: center; justify-content: center; gap: 4px;
+      background: #fff; color: #1d63d8; border: 1px solid #c5d9f7; border-radius: 8px;
+      font-size: 12px; cursor: pointer; font-family: inherit; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .side-actions .btn-check:hover:not(:disabled),
+    .side-actions .btn-manage:hover { background: #f2f7ff; }
+    .side-actions .btn-manage.on { background: #1d63d8; border-color: #1d63d8; color: #fff; }
+    .side-actions .btn-manage.on:hover { background: #174ec0; }
+    .side-actions .btn-check[hidden],
+    .side-actions .btn-manage[hidden] { display: none; }
+    /* 管理态不新增行：整宽主按钮换成「完成」，这一行换成「全选 / 删除」，
+       两个状态占同样的位置和高度，切换时页面不会上下跳 */
+    .mgr-btn {
+      padding: 7px 0; font-size: 12px; line-height: 17px; cursor: pointer;
+      border: 1px solid #c5d9f7; background: #fff; color: #3b6fd4;
+      border-radius: 8px; font-family: inherit; white-space: nowrap;
+      flex: 1 1 0; min-width: 0;
+    }
+    .side-actions .mgr-btn[hidden] { display: none; }
+    .mgr-btn:hover:not(:disabled) { background: #e6f0ff; }
+    .mgr-btn:disabled { opacity: .45; cursor: default; }
+    .mgr-btn.danger { border-color: #f3c9c9; color: #c0392b; }
+    .mgr-btn.danger:hover:not(:disabled) { background: #fdecec; }
+    /* 侧栏顶部：聚合搜索入口 */
+    .btn-search-entry {
+      display: flex; align-items: center; gap: 7px;
+      margin: 12px 14px 6px; padding: 8px 10px;
+      background: #f5f7fb; border: 1px solid #e3e8f2; border-radius: 8px;
+      font-size: 12px; color: #5a6474; cursor: pointer; font-family: inherit;
+      text-align: left; transition: background .12s, border-color .12s, color .12s;
+    }
+    .btn-search-entry:hover { background: #eef3fd; border-color: #c5d9f7; color: #1d63d8; }
+    .se-icon { flex: 0 0 auto; font-size: 13px; line-height: 1; }
+    .se-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .se-kbd { flex: 0 0 auto; font-size: 10px; color: #9aa1ad; }
+    body[data-sidebar-narrow] .se-kbd { display: none; }
+    /* 聚合搜索面板 */
+    /* 面板放宽到 780（小窗口按 92vw 收），信息一屏看得更多 */
+    /* 必须写成 .modal.search-modal：.modal 的 380px 在后面定义，单类会被它盖掉 */
+    .modal.search-modal { width: min(1100px, 78vw); max-height: 90vh; display: flex; flex-direction: column; }
+    .search-bar {
+      display: flex; align-items: center; gap: 8px;
+      margin: 0 20px; padding: 9px 14px;
+      background: #f5f7fb; border: 1px solid #e3e8f2; border-radius: 10px;
+      transition: background .12s, border-color .12s;
+    }
+    .search-bar:focus-within { background: #fff; border-color: #c5d9f7; }
+    .sf-icon { flex: 0 0 auto; font-size: 13px; opacity: .6; }
+    .search-input {
+      flex: 1 1 auto; min-width: 0; border: 0; background: transparent;
+      outline: none; font: inherit; font-size: 13px; color: #1d1d1f;
+    }
+    .search-clear {
+      flex: 0 0 auto; border: 0; background: none; font-size: 11px;
+      color: #86868b; cursor: pointer; font-family: inherit;
+    }
+    .search-clear:hover { color: #1d63d8; }
+    /* 重新加载：豆包的结果是分批渲染的，偶尔只回来一部分，给个手动补一刀的入口 */
+    .search-reload {
+      flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px;
+      border: 1px solid #e3e8f2; background: #fff; border-radius: 7px;
+      padding: 3px 9px; font-size: 11.5px; color: #515154; font-family: inherit;
+      cursor: pointer; transition: border-color .12s, color .12s, background .12s;
+    }
+    .search-reload:hover { border-color: #c5d9f7; color: #1d63d8; background: #f7faff; }
+    /* 写了 display 就必须补这条：作者样式的 display 会盖掉 [hidden] 的 UA 默认值 */
+    .search-reload[hidden] { display: none; }
+    .search-reload:disabled { opacity: .6; cursor: default; }
+    .search-reload .srl-ico { display: inline-block; line-height: 1; }
+    .search-reload.loading .srl-ico { animation: accspin .9s linear infinite; }
+    /* 档2 本地缓存开关：默认关，旁边一句话提示 + 清空入口 */
+    .search-cache {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      margin: 8px 20px 0; font-size: 11.5px;
+    }
+    .sc-toggle { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; flex: 0 0 auto; user-select: none; }
+    .sc-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .sc-track {
+      flex: 0 0 auto; width: 30px; height: 17px; border-radius: 9px;
+      background: #d4d9e3; position: relative; transition: background .15s;
+    }
+    .sc-thumb {
+      position: absolute; top: 2px; left: 2px; width: 13px; height: 13px;
+      border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 2px rgba(0,0,0,.2);
+    }
+    .sc-toggle input:checked + .sc-track { background: #1d63d8; }
+    .sc-toggle input:checked + .sc-track .sc-thumb { left: 15px; }
+    .sc-toggle input:focus-visible + .sc-track { outline: 2px solid #9cc0f5; outline-offset: 1px; }
+    .sc-name { color: #515154; font-weight: 600; }
+    .sc-hint { flex: 1 1 200px; min-width: 0; color: #9aa1ad; line-height: 1.5; }
+    .sc-clear {
+      flex: 0 0 auto; border: 1px solid #e3e8f2; background: #fff; border-radius: 6px;
+      padding: 2px 8px; font-size: 11px; color: #86868b; cursor: pointer; font-family: inherit;
+    }
+    .sc-clear:hover { border-color: #f0c2c2; color: #d22e45; background: #fff7f7; }
+    .sc-clear[hidden] { display: none; }
+    /* 最近搜索：搜索框下面一排词，点词重搜，点 × 删掉 */
+    .search-recent {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      margin: 8px 20px 0;
+    }
+    .search-recent[hidden] { display: none; }
+    .rec-label { flex: 0 0 auto; font-size: 11px; color: #9aa1ad; }
+    .rec-chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 4px 2px 9px; border-radius: 12px;
+      background: #f0f4fb; border: 1px solid #e3e8f2;
+      font-size: 11.5px; color: #515154; font-family: inherit; cursor: pointer;
+      transition: background .12s, border-color .12s, color .12s;
+      max-width: 180px;
+    }
+    .rec-chip:hover { background: #e9f0ff; border-color: #c5d9f7; color: #1d63d8; }
+    .rec-txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rec-x {
+      flex: 0 0 auto; width: 15px; height: 15px; line-height: 14px; text-align: center;
+      border-radius: 50%; font-size: 12px; color: #9aa1ad;
+    }
+    .rec-x:hover { background: #dbe6f8; color: #d22e45; }
+    /* 缓存完成度：一条细进度条 + 一句话说明 */
+    .search-cache-status {
+      display: flex; align-items: center; gap: 8px; margin: 6px 20px 0;
+      font-size: 11px; color: #86868b;
+    }
+    .search-cache-status[hidden] { display: none; }
+    .scs-bar {
+      flex: 0 0 auto; width: 120px; height: 6px; border-radius: 3px;
+      background: #e9edf4; overflow: hidden;
+    }
+    .scs-fill {
+      display: block; width: 0%; height: 100%; border-radius: 3px;
+      background: #1d63d8; transition: width .2s ease, background .2s;
+    }
+    .search-cache-status.warn .scs-fill { background: #e0a112; }
+    .search-cache-status.ok .scs-fill { background: #00B578; }
+    .search-cache-status.warn .scs-text { color: #b26a00; }
+    .search-cache-status.ok .scs-text { color: #00875a; }
+    /* 缓存补回来的旧条目标一下，跟实时结果区分开 */
+    .sr-cache {
+      flex: 0 0 auto; margin-top: 1px; font-size: 10px; line-height: 16px;
+      padding: 0 5px; border-radius: 4px; background: #fff4e2; color: #b26a00;
+    }
+    .sr-item.sr-from-cache { opacity: .82; }
+    .search-filters { margin: 10px 20px 0; }
+    .sf-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; min-height: 22px; }
+    .sf-label { flex: 0 0 auto; font-size: 11px; color: #9aa1ad; }
+    .sf-chip {
+      display: inline-flex; align-items: center; gap: 4px; max-width: 190px;
+      padding: 3px 9px; border-radius: 12px; border: 1px solid #e3e8f2; background: #fff;
+      color: #515154; font-size: 11.5px; font-family: inherit; cursor: pointer;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      transition: background .12s, border-color .12s, color .12s;
+    }
+    .sf-chip:hover { border-color: #c5d9f7; color: #1d63d8; }
+    .sf-chip.on { background: #1d63d8; border-color: #1d63d8; color: #fff; }
+    .sf-chip .n { font-size: 10px; opacity: .65; }
+    .sf-chip.on .n { opacity: .85; }
+    .sf-hint { font-size: 11px; color: #9aa1ad; }
+    .sf-month {
+      flex: 0 0 auto; width: 118px; padding: 2px 7px; font-size: 11px;
+      font-family: inherit; color: #515154; background: #fff;
+      border: 1px solid #e3e8f2; border-radius: 6px;
+    }
+    .search-meta { margin: 9px 20px 3px; font-size: 11px; color: #86868b; min-height: 16px; }
+    .search-results { flex: 1 1 auto; overflow-y: auto; padding: 2px 14px 14px; overflow-anchor: none; }
+    .sr-group {
+      display: flex; align-items: center; gap: 7px;
+      margin: 10px 6px 4px; font-size: 12px; font-weight: 600; color: #1d1d1f;
+    }
+    .sr-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+    .sr-count { margin-left: auto; font-size: 11px; font-weight: 400; color: #86868b; }
+    .sr-item {
+      display: flex; align-items: flex-start; gap: 8px;
+      padding: 9px 12px; border-radius: 8px; cursor: pointer;
+      transition: background .1s;
+    }
+    .sr-item:hover { background: #f2f7ff; }
+    /* 流式搜索期间，还没收齐全量的账号先淡显 */
+    .sr-item.sr-loading { opacity: .58; }
+    .sr-kind {
+      flex: 0 0 auto; margin-top: 1px; font-size: 10px; line-height: 16px;
+      padding: 0 5px; border-radius: 4px; background: #eef1f6; color: #6b7280;
+    }
+    .sr-kind.msg { background: #e8f1fe; color: #1d63d8; }
+    /* 每条结果都带账号，滚很远也知道是哪個账号的，不用回头找分组头 */
+    .sr-acct {
+      flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px;
+      max-width: 92px; margin-top: 1px; line-height: 16px; font-size: 10px;
+      color: #86868b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .sr-acct i { width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; }
+    .sr-pending { padding: 8px 12px; font-size: 11px; color: #9aa1ad; }
+    .sr-body { flex: 1 1 auto; min-width: 0; }
+    .sr-title {
+      font-size: 12.5px; color: #1d1d1f;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .sr-snippet {
+      margin-top: 2px; font-size: 11.5px; color: #6b7280; line-height: 1.55;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .sr-snippet mark, .sr-title mark { background: #fff2ba; color: inherit; padding: 0 1px; border-radius: 2px; }
+    .sr-time { flex: 0 0 auto; margin-top: 2px; font-size: 10.5px; color: #9aa1ad; white-space: nowrap; }
+    .search-empty { padding: 30px 0; text-align: center; font-size: 12px; color: #9aa1ad; line-height: 1.9; }
+    /* 管理态下的账号项：勾选 + 拖动 */
+    .account-item.mgr { cursor: pointer; }
+    .account-item.mgr.selected { background: #eaf2ff; border-color: #b9d2f8; }
+    .account-item .mgr-check { margin: 0 1px 0 0; flex: 0 0 auto; accent-color: #1d63d8; cursor: pointer; }
+    .account-item.dragging { opacity: .4; }
+    .account-item.drop-before { box-shadow: inset 0 2px 0 #1d63d8; }
+    .account-item.drop-after { box-shadow: inset 0 -2px 0 #1d63d8; }
     .account-list { flex: 1; overflow-y: auto; padding: 4px 8px; }
     .account-item {
       display: flex; align-items: center; gap: 7px;
@@ -132,7 +399,8 @@
     .toast b { cursor: pointer; text-decoration: underline; }
     @keyframes fadein { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
     /* v3.0.15: 顶部版本按钮 + 检查更新弹窗 */
-    .brand-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .brand-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+    .brand-row h1 { flex: 1 1 auto; min-width: 0; }
     .ver-btn {
       font-size: 10px; line-height: 16px; padding: 0 7px; border-radius: 9px;
       background: #f0f0f4; color: #515154; border: 1px solid #e3e3e8;
@@ -140,6 +408,14 @@
     }
     .ver-btn:hover { background: #e8f1fe; color: #1d63d8; border-color: #c5d9f7; }
     .ver-btn.has-new { background: #ff3b30; border-color: #ff3b30; color: #fff; }
+    .app-menu-btn {
+      flex: 0 0 auto; width: 26px; height: 24px; padding: 0;
+      border: 1px solid #e3e3e8; border-radius: 7px;
+      background: #fff; color: #515154; font-size: 15px; line-height: 1;
+      cursor: pointer; font-family: inherit;
+    }
+    .app-menu-btn:hover { background: #eef3fd; color: #1d63d8; border-color: #c5d9f7; }
+    .app-menu-btn:active { background: #e3edfd; }
     .mask {
       position: fixed; inset: 0; background: rgba(0,0,0,.28);
       display: flex; align-items: center; justify-content: center; z-index: 200;
@@ -241,9 +517,35 @@
     #setMask .modal-head, #setMask .modal-foot { flex: 0 0 auto; }
   
   /* 批量发送弹窗 */
-  .bc-list { max-height: 92px; overflow: auto; border: 1px solid var(--line, #e5e5e5); border-radius: 8px; padding: 6px 8px; }
-  .bc-item { display: flex; align-items: center; gap: 8px; padding: 4px 2px; font-size: 13px; cursor: pointer; }
-  .bc-item input { margin: 0; }
+  /* 账号列表：两列卡片。同样高度能多看一倍，账号少时还会自动收缩不撑高 */
+  .bc-listhead { display: flex; align-items: center; gap: 6px; }
+  .bc-listhead .set-label { margin: 0; }
+  .bc-count { margin-left: auto; font-size: 11px; color: #86868b; white-space: nowrap; }
+  .bc-mini {
+    padding: 2px 8px; font-size: 11px; line-height: 16px; cursor: pointer;
+    border: 1px solid #e3e3e8; background: #fff; border-radius: 6px;
+    color: #515154; font-family: inherit; white-space: nowrap;
+  }
+  .bc-mini:hover:not(:disabled) { border-color: #c9d8f7; color: #3b6fd4; }
+  .bc-mini:disabled { opacity: .45; cursor: default; }
+  .bc-list {
+    margin-top: 7px; padding: 6px; border: 1px solid var(--line, #e5e5e5); border-radius: 8px;
+    max-height: 156px; overflow: auto; overscroll-behavior: contain;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px 6px; align-content: start;
+  }
+  .bc-item {
+    display: flex; align-items: center; gap: 7px; min-width: 0;
+    padding: 6px 8px; font-size: 13px; cursor: pointer;
+    border: 1px solid transparent; border-radius: 7px;
+    transition: background .12s, border-color .12s, color .12s;
+  }
+  .bc-item:hover { background: #f5f7fb; border-color: #e2e9f8; }
+  .bc-item.on { background: rgba(79,134,247,.09); border-color: #b9cdf7; }
+  .bc-item.on span { color: #2f5fd0; font-weight: 500; }
+  .bc-item input { margin: 0; flex: 0 0 auto; accent-color: #4F86F7; cursor: pointer; }
+  .bc-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bc-empty { grid-column: 1 / -1; font-size: 12px; opacity: .6; padding: 6px 2px; }
+  .bc-empty.err { color: #d33; opacity: 1; }
   /* 标题行：左边标题，右边提示 */
   .bc-imgtitle { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
   .bc-imghint { font-size: 11px; opacity: .55; white-space: nowrap; }
@@ -338,15 +640,26 @@
 </style>
 </head>
 <body>
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
       <div class="brand-row">
         <h1>豆包多开管理器</h1>
         <button class="ver-btn" id="btnUpdate" title="检查更新">测试版v—</button>
+        <button class="app-menu-btn" id="btnAppMenu" type="button" title="应用菜单（按 Alt 也可打开原生菜单）">☰</button>
       </div>
     </div>
+    <button class="btn-search-entry" id="btnSearch" title="搜索所有账号的消息（Ctrl+Shift+F）">
+      <span class="se-icon">🔍</span>
+      <span class="se-text" id="btnSearchText">搜索所有账号消息</span>
+      <span class="se-kbd">Ctrl+Shift+F</span>
+    </button>
     <button class="btn-add" id="btnAdd">＋ 添加账号（在右侧页面直接扫码）</button>
-    <button class="btn-check" id="btnCheckAll" title="逐个检查所有账号的登录凭证，自动修正侧栏在线状态">⟳ 检测账号状态</button>
+    <div class="side-actions">
+      <button class="btn-check" id="btnCheckAll" title="逐个检查所有账号的登录凭证，自动修正侧栏在线状态">⟳ 检测账号</button>
+      <button class="btn-manage" id="btnManage" title="管理账号：多选批量删除、拖动调整上下顺序">☰ 管理</button>
+      <button type="button" class="mgr-btn" id="mgrAll" hidden>全选</button>
+      <button type="button" class="mgr-btn danger" id="mgrDel" hidden disabled>删除</button>
+    </div>
     <div class="account-list" id="accountList"></div>
     <div class="sidebar-footer">
       <div class="author-row">
@@ -356,6 +669,7 @@
         <a href="#" id="lnkDl" style="color:#1d63d8;">打开下载目录</a>
       </div>
     </div>
+    <div class="sidebar-resizer" id="sidebarResizer" title="按住拖动可调整侧栏宽度（168~360）"></div>
   </aside>
   <div class="main-area">
     <div class="main-tip" id="mainTip">
@@ -443,7 +757,12 @@
             <button type="button" class="bc-tab" data-tab="video">生成视频</button>
           </div>
           <div class="set-warn" id="bcWarn" hidden></div>
-          <div class="set-label">发送到哪些账号</div>
+          <div class="bc-listhead">
+            <span class="set-label">发送到哪些账号</span>
+            <span class="bc-count" id="bcCount">已选 0 / 共 0</span>
+            <button type="button" class="bc-mini" id="bcAll">全选</button>
+            <button type="button" class="bc-mini" id="bcNone">清空</button>
+          </div>
           <div id="bcList" class="bc-list"></div>
           <div class="bc-imgtitle">
               <span class="set-label" style="margin:0">要一起发送的图片（可选）</span>
@@ -499,6 +818,42 @@
         </div>
     </div>
   </div>
+  <!-- 聚合搜索：一次搜所有账号的消息 -->
+  <div class="mask" id="searchMask" hidden tabindex="-1">
+    <div class="modal search-modal">
+      <div class="modal-head">
+        <span>聚合搜索</span>
+        <button type="button" class="modal-x" id="searchClose" title="关闭">×</button>
+      </div>
+      <div class="search-bar">
+        <span class="sf-icon">🔍</span>
+        <input id="searchInput" class="search-input" placeholder="搜所有账号的消息…" spellcheck="false" autocomplete="off">
+        <button type="button" class="search-clear" id="searchClear" hidden>清空</button>
+        <button type="button" class="search-reload" id="searchReload" hidden
+                title="重新搜一遍：豆包的结果是分批加载的，补一刀能补齐没回来的条目"><span class="srl-ico">↻</span><span class="srl-txt">重新加载</span></button>
+      </div>
+      <div class="search-recent" id="searchRecent" hidden></div>
+      <div class="search-cache" id="searchCacheRow">
+        <label class="sc-toggle" title="开启后，搜到的消息会在本地存一份。下次搜同一个词，万一豆包这次少加载了旧消息，就用缓存补上（会标「缓存」）。新消息永远实时搜，不受影响。">
+          <input type="checkbox" id="searchCacheToggle">
+          <span class="sc-track"><span class="sc-thumb"></span></span>
+          <span class="sc-name">缓存搜过的消息</span>
+        </label>
+        <span class="sc-hint" id="searchCacheHint" title="「缓存 N 条」= 当前这个词在本地存了多少条；「其中 N 条来自缓存」= 本次结果里有多少条是缓存补的（不是缓存大小）。">默认关闭，开启后才会存到本地</span>
+        <button type="button" class="sc-clear" id="searchCacheClear" hidden>清空缓存</button>
+      </div>
+      <div class="search-cache-status" id="searchCacheStatus" hidden>
+        <span class="scs-bar"><span class="scs-fill" id="searchCacheBar"></span></span>
+        <span class="scs-text" id="searchCacheStatusText"></span>
+      </div>
+      <div class="search-filters" id="searchFilters" hidden></div>
+      <div class="search-meta" id="searchMeta"></div>
+      <div class="search-results" id="searchResults">
+        <div class="search-empty">输入关键词，自动搜索所有账号<br>点结果可直接跳到那条消息</div>
+      </div>
+    </div>
+  </div>
+
   <!-- 删除账号二次确认 -->
   <div class="mask" id="delMask" hidden tabindex="-1">
     <div class="modal del-modal">

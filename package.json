@@ -1,7 +1,7 @@
 {
   "name": "doubao-multi-open",
   "productName": "doubao-multi-open",
-  "version": "4.2.6",
+  "version": "4.2.7",
   "description": "豆包多账号管理器 - 视图池架构 · 单窗口毫秒级切号",
   "author": "杂粮煎饼",
   "main": "main.js",
@@ -12,7 +12,7 @@
   },
   "scripts": {
     "start": "electron .",
-    "test": "node tests/boot-check.js && node tests/download-name.test.js && node tests/download-flow.test.js && node tests/update-script.test.js"
+    "test": "node tests/boot-check.js && node tests/download-name.test.js && node tests/download-flow.test.js && node tests/update-script.test.js && node tests/bc-list-ui.test.js && node tests/account-order.test.js && node tests/sidebar-manage.test.js && node tests/sidebar-resize.test.js && node tests/page-search.test.js && node tests/agg-search.test.js && node tests/jump-sim.test.js && node tests/highlight-sim.test.js && node tests/wait-stable.test.js && node tests/time-filter.test.js && node tests/search-cache.test.js && node tests/jump-refine.test.js && node tests/app-menu.test.js && node tests/main-robustness.test.js && node tests/query-plan.test.js"
   },
   "engines": {
     "node": ">=22.12.0"
