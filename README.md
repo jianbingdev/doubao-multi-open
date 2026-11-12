@@ -1,18 +1,28 @@
+<div align="center">
+
 # 豆包多开管理器
 
-![version](https://img.shields.io/badge/version-4.2.7-blue) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![license](https://img.shields.io/badge/license-MIT-green)
+> **一个窗口，管住所有豆包账号。**
+> 每个账号一条独立会话、一条常驻页面，切号只是把页面显示出来 —— 毫秒级、不重载、不丢对话。
 
-**一个窗口，管住所有豆包账号。**
+[![version](https://img.shields.io/badge/version-4.2.7-blue?style=flat-square)](../../releases)
+[![platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)](#下载即用)
+[![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+![search](https://img.shields.io/badge/聚合搜索-✓-blue?style=flat-square)
+![cache](https://img.shields.io/badge/本地缓存-✓-blue?style=flat-square)
 
-每个账号一条独立会话、一条常驻页面，切号只是把页面显示出来 ——
-**毫秒级、不重载、不丢对话**，所有账号一直在线。
+[功能](#功能) · [聚合搜索](#聚合搜索一次搜所有账号的消息) · [下载即用](#下载即用) · [快捷键](#快捷键) · [原理](#原理) · [自动更新](#自动更新)
 
-> 本项目基于 [niulaizhineng/doubao-multi-open](https://github.com/niulaizhineng/doubao-multi-open)（MIT）**修改优化**，
-> 原作者：[牛来智能](https://github.com/niulaizhineng)。原版版权声明按 MIT 要求保留在 [LICENSE](LICENSE)。
-
-![豆包多开管理器主界面](docs/screenshot.png)
+<img src="docs/screenshot.png" width="720" alt="豆包多开管理器主界面" />
 
 <sub>截图里的账号和消息都是演示数据</sub>
+
+</div>
+
+---
+
+本工具基于 [niulaizhineng/doubao-multi-open](https://github.com/niulaizhineng/doubao-multi-open)（MIT）修改优化，
+原作者 [牛来智能](https://github.com/niulaizhineng)，原版版权声明按 MIT 要求保留在 [LICENSE](LICENSE)。
 
 ## 为什么需要它
 
@@ -25,7 +35,22 @@
 | 多个浏览器 / 无痕窗口 | ✓ | 找窗口、切窗口 | 窗口一关就没了 |
 | **本工具** | ✓ | 点一下侧栏（毫秒级） | 页面常驻，不重载 |
 
+<a id="功能"></a>
+
 ## 功能
+
+<a id="聚合搜索一次搜所有账号的消息"></a>
+
+### 聚合搜索：一次搜所有账号的消息
+
+<img src="docs/feature-search.png" width="720">
+
+输入一个词，所有账号同时搜，结果按账号分组列出。点某一条直接切到那个账号、
+打开那条消息并高亮。深处的消息也不用一页页翻：找不到时自动换几个更精确的词浅试，
+还不行就回原词深翻，翻到为止。
+
+搜过的词可以存在本地（开关默认关）。再搜同一个词时先把缓存结果摆出来、每条标「缓存」，
+实时搜索继续在后台跑，新消息照样补进来 —— 历史秒出，新消息不漏。支持按时间筛选（近 1 个月 / 近 3 个月 / 自选）。
 
 ### 多账号同屏，状态一眼看清
 
@@ -40,44 +65,6 @@
 - **当前账号** —— 蓝底描边，切走再切回，对话原样还在
 
 点「⟳ 检测」可以全量刷新状态；点某个账号的状态徽标可以单独检测它。
-
-### 聚合搜索：一次搜所有账号的消息
-
-<img src="docs/feature-search.png" width="720">
-
-输入一个词，所有账号同时搜，结果按账号分组列出。点某一条直接切到那个账号、
-打开那条消息并高亮。深处的消息也不用一页页翻：找不到时自动换几个更精确的词浅试，
-还不行就回原词深翻，翻到为止。
-
-搜过的词可以存在本地（开关默认关）。再搜同一个词时先把缓存结果摆出来、每条标「缓存」，
-实时搜索继续在后台跑，新消息照样补进来 —— 历史秒出，新消息不漏。支持按时间筛选（近 1 个月 / 近 3 个月 / 自选）。
-
-### 双击就地改名
-
-<img src="docs/feature-rename.png" width="320">
-
-双击账号名直接变成输入框，`Enter` 保存、`Esc` 取消，不用弹窗。
-登录后会自动读取官方接口的昵称填进去，但**只改默认名，不会覆盖你手动改过的名字**。
-
-### 添加账号 = 直接在右侧扫码
-
-点「＋ 添加账号」，右侧立刻开出一个独立的豆包页面，扫码或验证码登录后自动转正成正式账号，
-不用跳转、不用复制 Cookie。
-
-### 检查更新，一键升级
-
-<img src="docs/feature-update.png" width="375"> <img src="docs/feature-download.png" width="375">
-
-点侧栏顶部的版本号（或侧栏「☰」菜单 → 帮助 → 检查更新，快捷键 `Ctrl+U`）：
-比对版本 → 显示更新说明和体积 → 下载带进度 → 下完点「重启并更新」，
-软件自己关掉、自己重开，已经是新版。
-
-下载期间可以把弹窗关掉继续干活，进度转到侧栏版本号徽标上，下完变红提示「可更新」。
-更新、设置弹窗只认右上角的 ×，点外面、按 Esc 都不会误关。
-
-**增量更新**：升级只下载**核心包（几百 KB）**，只替换 `resources\app\` 里的程序文件，
-不碰 Electron 运行时，几秒钟完成。`userdata\`（登录态）、`downloads\`、`profiles\` 一律不动 ——
-升级完不用重新扫码，生成的视频图片都还在。详见 [自动更新](#自动更新)。
 
 ### 批量发送：一段话发给多个账号
 
@@ -103,6 +90,33 @@
 - 「批量下载」—— 存到 `下载目录\图片-时间戳\`
 
 自己粘贴进对话的图也能选。懒加载的图加载完会自动补上复选框，缩略图大于 30px 也能勾。
+
+### 检查更新，一键升级
+
+<img src="docs/feature-update.png" width="375"> <img src="docs/feature-download.png" width="375">
+
+点侧栏顶部的版本号（或侧栏「☰」菜单 → 帮助 → 检查更新，快捷键 `Ctrl+U`）：
+比对版本 → 显示更新说明和体积 → 下载带进度 → 下完点「重启并更新」，
+软件自己关掉、自己重开，已经是新版。
+
+下载期间可以把弹窗关掉继续干活，进度转到侧栏版本号徽标上，下完变红提示「可更新」。
+更新、设置弹窗只认右上角的 ×，点外面、按 Esc 都不会误关。
+
+**增量更新**：升级只下载**核心包（几百 KB）**，只替换 `resources\app\` 里的程序文件，
+不碰 Electron 运行时，几秒钟完成。`userdata\`（登录态）、`downloads\`、`profiles\` 一律不动 ——
+升级完不用重新扫码，生成的视频图片都还在。
+
+### 双击就地改名
+
+<img src="docs/feature-rename.png" width="320">
+
+双击账号名直接变成输入框，`Enter` 保存、`Esc` 取消，不用弹窗。
+登录后会自动读取官方接口的昵称填进去，但**只改默认名，不会覆盖你手动改过的名字**。
+
+### 添加账号 = 直接在右侧扫码
+
+点「＋ 添加账号」，右侧立刻开出一个独立的豆包页面，扫码或验证码登录后自动转正成正式账号，
+不用跳转、不用复制 Cookie。
 
 ### 账号右键菜单
 
@@ -184,6 +198,11 @@ cd node_modules/electron && node install.js
 ```
 </details>
 
+<details>
+<summary>自动更新与发布（点开查看：更新源配置、核心包结构、维护者发版命令）</summary>
+
+<a id="自动更新"></a>
+
 ## 自动更新
 
 侧栏顶部的版本号徽标就是入口（侧栏「☰」菜单 → 帮助 → 检查更新，快捷键 `Ctrl+U` 同效）。
@@ -234,7 +253,10 @@ node _release\release.js 4.2.7 --core-only --full-from 4.2
 > **tag 必须与版本号一致**（脚本已保证）；版本号必须递增，客户端只认「远端 > 本地」；
 > 比较只看前三段数字，`v` 前缀会被忽略。
 
-## 目录结构
+</details>
+
+<details>
+<summary>目录结构（点开查看）</summary>
 
 ```
 doubao-multi-open\
@@ -261,6 +283,8 @@ doubao-multi-open\
 ├─ downloads\     下载目录（默认用系统「下载」文件夹）
 └─ *.log          运行日志、更新日志
 ```
+
+</details>
 
 ## 风险须知
 
