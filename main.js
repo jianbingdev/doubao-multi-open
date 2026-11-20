@@ -21,6 +21,10 @@ const dlName = require('./download-name');   // 纯函数: 下载自动命名, �
 const { reorderAccounts } = require('./account-order');   // 纯函数: 账号顺序重排(保证不丢)
 const pageSearch = require('./page-search');   // 注入豆包页面的搜索脚本 + 结果整理
 const searchCache = require('./search-cache');   // 纯函数: 聚合搜索本地缓存(档2), 不依赖 electron
+const clipStore = require('./clip-store');   // 剪贴板临时图片: 批次目录命名 + 保留策略清理
+const genState = require('./gen-state');   // 页面尾部文案判定: 后台任务/完成/失败(嵌进注入脚本)
+const clipClipboard = require('./clip-clipboard');   // 文件+文字混合写剪贴板的 PowerShell 脚本
+const reclaimPlan = require('./reclaim-plan');   // 自动内存回收：只挑长时间没用的账号
 
 // v3.0.12: 打包成便携版后没有 bat 帮忙传参数, 而部分机器的 GPU 进程沙箱会被系统策略拦截
 // (表现为连续报 GPU process isn't usable 然后白屏/闪退)。在这里兜底, 双击 exe 即可启动。
@@ -574,6 +578,11 @@ async function tryAutoRename(accountId, force) {
 }
 
 // ---------- 视图池 ----------
+// 账号最近一次被切到的时间 / 最近一次清 session 缓存的时间。
+// 自动回收只碰“长时间没用”的账号，避免把常用页面的缓存反复清冷（切号卡顿的来源之一）。
+const accountLastActive = new Map();
+const accountLastReclaim = new Map();
+
 function markBadge(id, st) {
   badges.set(id, st);
   pushToRenderer('badge:update', { id, status: st });
@@ -599,6 +608,7 @@ function createViewForAccount(account) {
   });
   view.__retries = 0;
   view.__createdAt = Date.now();   // v3.0.3: 用于过滤加载期的状态跳变
+  accountLastActive.set(account.id, Date.now());
   const wc = view.webContents;
 
   wc.setUserAgent(CHROME_UA);
@@ -707,7 +717,18 @@ function setActiveAccount(id) {
     log('视图池新建: ' + account.label);
   }
   const view = viewPool.get(id);
+  // 长时间没用的页面先踢一脚：让隐藏的 renderer 先做一次布局/唤醒，
+  // 再挂到窗口上，减少切过去第一下点击被长布局卡住。
+  const idleMs = Date.now() - (accountLastActive.get(id) || 0);
+  if (idleMs > 10 * 60 * 1000) {
+    try { view.webContents.invalidate(); } catch (e) {}
+    try {
+      view.webContents.executeJavaScript('void (document.body && document.body.offsetHeight)', true).catch(() => {});
+    } catch (e) {}
+    log('唤醒空闲页面(' + Math.round(idleMs / 60000) + ' 分钟): ' + account.label);
+  }
   attachView(view);
+  accountLastActive.set(id, Date.now());
   activeAccountId = id;
   // 弹窗正处于打开状态时切号(如 Ctrl+1), 新挂上来的视图同样会盖住弹窗
   if (isUiModalOpen()) applyViewVisibility();
@@ -1063,37 +1084,10 @@ const GEN_TASK_MAX_WAIT = 20 * 60 * 1000;  // 后台任务等待上限(实测 5 
 // 表现为"提前切走就不转圈、也不提示"。所以结束后先开一个观察窗, 期间文案一出现就转入等待态。
 const GEN_SETTLE_MS = 2500;
 
-const GEN_STATE_SCRIPT = `(() => {
-  try {
-    // 判据只认 [data-testid="chat_input_local_break_button"](停止生成按钮)。
-    // 不能把 message_loading 一起算: 实测它在"加载历史消息"时也会出现,
-    // 而生成中它 2.6s 就消失了(真正生成到 5.2s), 拿它当信号会误报。
-    var b = !!document.querySelector('[data-testid="chat_input_local_break_button"]');
-    var txt = document.body ? document.body.innerText : '';
-    var tail = txt.slice(-600);
-
-    // v3.0.10 实测(你好啊账号真实生成 5 秒视频)得到的两个关键文案:
-    //   任务已提交(按钮消失但还在后台跑):
-    //     "…大约需要 1-3 分钟。视频生成好后，我会主动发送给你。本次生成将消耗每日免费额度。"
-    //   任务完成:
-    //     "你的视频生成好了。"
-    // 注意: 页面里始终没有 <video> 元素, 所以不能拿 video 数量当产物判据。
-    // 关键词必须够"硬" —— 之前用"生成中/正在生成"这类宽泛词, 会把普通对话也误判成后台任务。
-    var taskPending = /生成好后[^。]{0,12}会主动发送|本次生成将消耗|预计等待\\s*\\d+\\s*分钟|大约需要\\s*\\d+[-~]?\\d*\\s*分钟/.test(tail);
-    var taskDone = /视频生成好了|生成好了|生成完成|已生成好|视频已生成/.test(tail);
-
-    var p = location.pathname || '';
-    var inChat = /^\\/chat\\/[^\\/]+/.test(p);
-    return {
-      busy: b,
-      len: txt.length,
-      inChat: inChat,
-      taskPending: taskPending,
-      taskDone: taskDone,
-      tail: tail.slice(-160)
-    };
-  } catch (e) { return null; }
-})()`;
+// 判据只认 [data-testid="chat_input_local_break_button"](停止生成按钮)；
+// 文案判定（已提交 / 完成 / 失败）在 gen-state.js，注入脚本由它生成，
+// 主进程与测试跑同一份实现。
+const GEN_STATE_SCRIPT = genState.buildStateScript();
 
 async function probeGenerating(accountId) {
   const v = viewPool.get(accountId);
@@ -1174,19 +1168,25 @@ async function tickGenWatcher() {
       if (genTaskWait.has(id)) {
         const tw = genTaskWait.get(id);
         const grew = real.len - (tw.len0 || 0);
-        const done = real.taskDone && grew > 5;
+        const failed = real.taskFailed;
+        const done = !failed && real.taskDone && grew > 5;
         const overtime = Date.now() - tw.startedAt > GEN_TASK_MAX_WAIT;
-        if (done || overtime) {
+        if (done || failed || overtime) {
           genTaskWait.delete(id);
           genSince.delete(id);
           genSeen.delete(id);
           genStartLen.delete(id);
           genSettle.delete(id);
           setGenBusy(id, false);
-          log((done
-            ? '后台任务完成(出现"生成好了"文案, 正文 +' + grew + ')'
-            : '后台任务等待超时, 强制收尾') + ': ' + id);
-          onGenerateFinished(id);
+          if (failed) {
+            log('后台任务失败(停止转圈): ' + id +
+              ' | 末尾: ' + String(real.tail || '').replace(/\s+/g, ' ').slice(-70));
+          } else {
+            log((done
+              ? '后台任务完成(出现"生成好了"文案, 正文 +' + grew + ')'
+              : '后台任务等待超时, 强制收尾') + ': ' + id);
+            onGenerateFinished(id);
+          }
         }
         continue;   // 等待期间不改 busy, 保持转圈
       }
@@ -1217,7 +1217,8 @@ async function tickGenWatcher() {
       const grew = real.len - (genStartLen.get(id) || 0);
 
       // 1) 明确的"任务已提交"信号 —— 立刻转入后台等待, 转圈不停
-      if (real.taskPending && !real.taskDone) {
+      //    已经出现失败文案就别再进等待态, 否则会一直转到 20 分钟超时
+      if (real.taskPending && !real.taskDone && !real.taskFailed) {
         genSettle.delete(id);
         genTaskWait.set(id, { len0: real.len, startedAt: Date.now() });
         log('检测到后台任务(已提交, 待产物), 保持转圈: ' + id +
@@ -1243,6 +1244,11 @@ async function tickGenWatcher() {
       genStartLen.delete(id);
 
       if (!seen) { log('乐观状态回落(未检测到生成): ' + id); continue; }
+      if (real.taskFailed) {
+        log('生成失败(不标完成): ' + id +
+          ' | 末尾: ' + String(real.tail || '').replace(/\s+/g, ' ').slice(-70));
+        continue;
+      }
       if (dur < GEN_MIN_DURATION) { log('忽略极短状态跳变(' + dur + 'ms): ' + id); continue; }
       // 真实生成一定让正文变长; 没变长说明是页面加载残留的按钮状态, 不是真生成
       if (grew < 10) { log('正文未增长(' + grew + ' 字符), 视为加载残留: ' + id); continue; }
@@ -1751,23 +1757,52 @@ function ShowMain() {
 // 用户在微信/资源管理器/豆包输入框里 Ctrl+V 就能全部粘出来。
 const CLIP_DIR = path.join(USER_DIR, '_clip');
 
-// 多个文件写进剪贴板。
+// 每批复刻写到独立批次目录：上一批的文件可能还被粘贴方（豆包 / 微信 / WPS）占着，
+// 覆盖同名文件会 EPERM。目录越攒越多的问题交给 clipStore.prune() 按策略清。
+function makeClipBatchDir() {
+  for (let i = 0; i < 5; i++) {
+    const dir = path.join(CLIP_DIR, clipStore.newBatchName());
+    if (fs.existsSync(dir)) continue;
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+  throw new Error('创建临时目录失败');
+}
+
+// 尽力清理旧批次：删不掉的（仍被占用）跳过，不打扰用户。
+function pruneClipBatches() {
+  try {
+    const s = clipStore.prune(CLIP_DIR);
+    if (s.deleted || s.legacy) {
+      log('清理剪贴板临时图片: ' + s.deleted + ' 批' +
+        (s.legacy ? ' + 旧文件 ' + s.legacy + ' 个' : '') +
+        (s.failed ? '（' + s.failed + ' 批被占用，跳过）' : ''));
+    }
+  } catch (err) {
+    log('清理剪贴板临时图片失败: ' + ((err && err.message) || err));
+  }
+}
+
+// 多个文件写进剪贴板；textFile 有值时同时写入 UnicodeText（图片 + 文字）。
 // 为什么不用 clipboard.writeBuffer('CF_HDROP')：Electron 的 writeBuffer 走的是
 // RegisterClipboardFormat(字符串)，传 "CF_HDROP" 只会注册出一个**同名的自定义格式**，
 // 不是系统预定义的 CF_HDROP(15)，资源管理器 / 微信 / 豆包全都读不到（实测过）。
-// 所以借 PowerShell 的 Set-Clipboard 来写，它会正确写 CF_HDROP。
+// 所以借 PowerShell 写；纯文件用 Set-Clipboard，混合格式用 WinForms DataObject
+// （脚本在 clip-clipboard.js 里拼，必须 -STA）。
 // 用 spawn 而不是 execFileSync，避免剪贴板被别的程序占着时把主进程卡住 15 秒。
-function writeFilesToClipboard(files) {
+function writeFilesToClipboard(files, textFile) {
   return new Promise((resolve, reject) => {
     if (process.platform !== 'win32') {
       // 非 Windows 没有 CF_HDROP，退回单图（够用就行）
-      try { clipboard.writeImage(nativeImage.createFromPath(files[0])); resolve(); }
-      catch (e) { reject(e); }
+      try {
+        clipboard.writeImage(nativeImage.createFromPath(files[0]));
+        if (textFile) clipboard.writeText(fs.readFileSync(textFile, 'utf8'));
+        resolve();
+      } catch (e) { reject(e); }
       return;
     }
-    const quoted = files.map((f) => "'" + String(f).replace(/'/g, "''") + "'").join(',');
-    const script = 'Set-Clipboard -LiteralPath @(' + quoted + ')';
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true });
+    const script = clipClipboard.buildSetClipboardScript(files, textFile);
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', script], { windowsHide: true });
     let errText = '';
     if (child.stderr) child.stderr.on('data', (d) => { errText += d.toString(); });
     const timer = setTimeout(() => {
@@ -1788,21 +1823,35 @@ function downloadImageTo(url, destBase) {
   return new Promise((resolve, reject) => {
     // data: URL（页面里把 blob 转过来的）直接解码落盘，不用走网络
     if (/^data:/i.test(url)) {
+      let meta = '';
+      let ext = 'png';
+      let buf = null;
       try {
         const comma = url.indexOf(',');
-        const meta = url.slice(0, comma);
-        const ext = /svg\+xml/i.test(meta) ? 'svg'
+        meta = url.slice(0, comma);
+        ext = /svg\+xml/i.test(meta) ? 'svg'
           : (/jpe?g/i.test(meta) ? 'jpg'
           : (/webp/i.test(meta) ? 'webp'
           : (/gif/i.test(meta) ? 'gif' : 'png')));
-        const buf = Buffer.from(url.slice(comma + 1), 'base64');
-        if (!buf.length) return reject(new Error('data URL 内容为空'));
-        const dest = destBase + '.' + ext;
-        fs.writeFileSync(dest, buf);
-        return resolve({ file: dest, bytes: buf.length, type: meta.slice(5, 40) });
+        buf = Buffer.from(url.slice(comma + 1), 'base64');
       } catch (e) {
         return reject(new Error('data URL 解析失败: ' + e.message));
       }
+      if (!buf.length) return reject(new Error('data URL 内容为空'));
+      let dest = destBase + '.' + ext;
+      try {
+        fs.writeFileSync(dest, buf);
+      } catch (e) {
+        // 目标名可能还被别的程序占着（旧版固定文件名会踩到）：换名再写一次
+        if (e.code === 'EPERM' || e.code === 'EACCES' || e.code === 'EBUSY') {
+          dest = destBase + '-' + Date.now().toString(36) + '.' + ext;
+          try { fs.writeFileSync(dest, buf); }
+          catch (e2) { return reject(new Error('写入临时图片失败: ' + e2.message)); }
+        } else {
+          return reject(new Error('写入临时图片失败: ' + e.message));
+        }
+      }
+      return resolve({ file: dest, bytes: buf.length, type: meta.slice(5, 40) });
     }
     let req;
     try {
@@ -1892,19 +1941,44 @@ function localStamp() {
     p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
 }
 
-ipcMain.handle('images:copy', async (e, urls) => {
+ipcMain.handle('images:copy', async (e, urls, text) => {
   try {
     const uniq = normalizeImageUrls(urls);
     if (!uniq.length) return { ok: false, error: '没有可复制的图片' };
-    // 每次都清掉上一批，免得剪贴板指向已经被覆盖或删掉的文件
-    const r = await fetchImagesTo(CLIP_DIR, uniq, '图片复制');
+    // 文字和图片同时进剪贴板（用户勾选「连同文字」才有）；上限防超长。
+    const note = String(text == null ? '' : text).trim().slice(0, 20000);
+    // 每批独立目录：不覆盖上一批（可能正被粘贴方占着），旧批次交给 prune 清
+    const dir = makeClipBatchDir();
+    const r = await fetchImagesTo(dir, uniq, '图片复制');
     if (!r.files.length) return { ok: false, error: r.errors[0] || '全部下载失败' };
 
-    await writeFilesToClipboard(r.files);
-    log('图片已写入剪贴板: ' + r.files.length + ' 张' + (r.errors.length ? '（失败 ' + r.errors.length + '）' : ''));
-    return { ok: true, action: 'copy', count: r.files.length, failed: r.errors.length, errors: r.errors };
+    let textFile = null;
+    if (note) {
+      textFile = path.join(dir, 'text.txt');
+      fs.writeFileSync(textFile, note, 'utf8');
+    }
+    await writeFilesToClipboard(r.files, textFile);
+    log('图片已写入剪贴板: ' + r.files.length + ' 张' + (note ? ' + 文字 ' + note.length + ' 字' : '') +
+      ' → ' + path.basename(dir) + (r.errors.length ? '（失败 ' + r.errors.length + '）' : ''));
+    pruneClipBatches();
+    return { ok: true, action: 'copy', count: r.files.length, failed: r.errors.length,
+      text: !!note, errors: r.errors };
   } catch (err) {
     log('图片复制整体失败: ' + ((err && err.message) || err));
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+});
+
+// 只复制文字：不落盘、不碰图片批次，直接写 UnicodeText。
+ipcMain.handle('text:copy', (e, text) => {
+  const note = String(text == null ? '' : text).trim().slice(0, 20000);
+  if (!note) return { ok: false, error: '没有可复制的文字' };
+  try {
+    clipboard.writeText(note);
+    log('文字已写入剪贴板: ' + note.length + ' 字');
+    return { ok: true, action: 'copyText', chars: note.length };
+  } catch (err) {
+    log('文字复制失败: ' + ((err && err.message) || err));
     return { ok: false, error: (err && err.message) || String(err) };
   }
 });
@@ -2012,6 +2086,47 @@ async function acquireAccountOp(id, kind, preemptSearch) {
   };
   st.active = op;
   return op;
+}
+
+// 关掉账号页上残留的豆包搜索浮层。搜索脚本自己要靠列表翻页、全程不关面板，
+// 所以搜过的每个账号都会留一个开着的浮层，切号时正好盖在对话区上。
+// 账号正在跳转/搜索时跳过（跳转结束自己会关），关不掉也不报错，只记日志。
+async function closeSearchPanel(accountId, waitMs) {
+  const st = accountOp(accountId);
+  if (st.active) return null;
+  const op = await new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; resolve(null); }
+    }, waitMs == null ? 300 : waitMs);
+    acquireAccountOp(accountId, 'panel', false).then((got) => {
+      if (settled) { got.release(); return; }   // 超时后才拿到锁，直接还回去
+      settled = true;
+      clearTimeout(timer);
+      resolve(got);
+    });
+  });
+  if (!op) return null;
+  try {
+    const v = viewPool.get(accountId);
+    if (!v || !v.webContents || v.webContents.isDestroyed()) return true;
+    try {
+      const r = await v.webContents.executeJavaScript(pageSearch.fillClosePanelScript(), true);
+      return !!(r && r.panelClosed);
+    } catch (err) {
+      return false;   // 页面正在导航，脚本被打断属正常
+    }
+  } finally {
+    op.release();
+  }
+}
+
+async function closeSearchPanels(accountIds) {
+  const rs = await Promise.all((accountIds || []).map((id) => closeSearchPanel(id)));
+  const bad = rs.filter((x) => x === false).length;
+  const skipped = rs.filter((x) => x === null).length;
+  if (bad || skipped) log('关搜索面板: 未关 ' + bad + ' 个, 跳过 ' + skipped + ' 个');
+  return bad;
 }
 
 ipcMain.handle('search:all', async (e, keyword, opts) => {
@@ -2333,6 +2448,9 @@ ipcMain.handle('search:all', async (e, keyword, opts) => {
       log('搜索缓存写入失败（不影响本次结果）: ' + ((err && err.message) || err));
     }
   }
+  // 结果已经全部拿到、写进缓存，现在才关各账号的搜索浮层：
+  // 关早了 stage3 就没列表可翻。跳转中的账号跳过，跳转脚本结束时自己会关。
+  await closeSearchPanels(list.map((a) => a.id));
   const hits = out.filter((x) => x.items.length);
   const deepPages = recs.reduce((n, x) => n + ((x.deep && x.deep.pages) || 0), 0);
   const deepCapped = recs.filter((x) => x.deep && x.deep.capped).length;
@@ -2543,7 +2661,13 @@ ipcMain.handle('accounts:list', () => {
   });
 });
 ipcMain.handle('accounts:add', async () => await startLoginInView());
-ipcMain.handle('accounts:select', (e, id) => { setActiveAccount(id); return true; });
+ipcMain.handle('accounts:select', (e, id) => {
+  setActiveAccount(id);
+  // 切过去顺手收掉残留的搜索浮层（搜索被换词/关窗打断时会留下）。
+  // 不等它：切号要跟手；跳转/搜索正在这个账号上跑时该函数会自己跳过。
+  closeSearchPanel(id).catch(() => {});
+  return true;
+});
 // ---------- 批量发送（把同一段话发到多个账号）----------
 // ⚠️ 必须逐个切到前台再注入，原因：豆包输入框是 ProseMirror，靠焦点决定是否处理 paste。
 // 后台视图里 executeJavaScript 能跑，但 paste 事件会被吞掉。
@@ -2881,6 +3005,8 @@ async function deleteAccountFull(id) {
   badges.delete(id);
   nameAttempts.delete(id);
   genBusy.delete(id);
+  accountLastActive.delete(id);
+  accountLastReclaim.delete(id);
   genDone.delete(id);
   genSince.delete(id);
   genSeen.delete(id);
@@ -2959,18 +3085,39 @@ function reloadAccountPage(id) {
 
 // ---------- 内存回收 ----------
 // 清的是 HTTP 缓存（图片/JS 那部分），不动 cookie 和 localStorage，登录态不受影响。
-// 代价是清完之后豆包会重新下载一些资源，所以只在内存真高的时候做。
-async function reclaimMemory(reason) {
-  let n = 0;
+// 以前每 5 分钟把所有账号都清一遍，缓存永远冷、切到闲置账号要重下资源（卡一下）。
+// 现在自动回收只挑“空闲 ≥1 小时、且 2 小时内没清过”的少量账号；手动回收仍清全部。
+async function reclaimMemory(reason, opts) {
+  const o = opts || {};
+  const now = Date.now();
+  let targets = [];
   for (const [id, v] of viewPool) {
+    if (!v || !v.webContents || v.webContents.isDestroyed()) continue;
+    targets.push({ id: id, v: v });
+  }
+  if (o.idleOnly) {
+    const ids = reclaimPlan.planReclaim(targets.map((t) => ({
+      id: t.id,
+      active: t.id === activeAccountId,
+      lastActiveAt: accountLastActive.get(t.id) || 0,
+      lastClearedAt: accountLastReclaim.get(t.id) || 0
+    })), { now: now, idleMs: o.idleMs, cooldownMs: o.cooldownMs, max: o.max });
+    const want = new Set(ids);
+    targets = targets.filter((t) => want.has(t.id));
+    if (!targets.length) return 0;   // 没有合格目标：静默，不刷日志
+  }
+  let n = 0;
+  const idleNotes = [];
+  for (const t of targets) {
     try {
-      const wc = v.webContents;
-      if (!wc || wc.isDestroyed()) continue;
-      await wc.session.clearCache();
+      await t.v.webContents.session.clearCache();
+      accountLastReclaim.set(t.id, now);
       n++;
+      idleNotes.push(Math.round((now - (accountLastActive.get(t.id) || 0)) / 60000) + '分钟');
     } catch (e) {}
   }
-  log('内存回收(' + reason + ')：清理 ' + n + ' 个账号的会话缓存');
+  log('内存回收(' + reason + ')：清理 ' + n + ' 个账号的会话缓存' +
+    (o.idleOnly && idleNotes.length ? '（空闲 ' + idleNotes.join(' / ') + '）' : ''));
   return n;
 }
 
@@ -2990,8 +3137,7 @@ function startAutoReclaim() {
         totalMB += kb / 1024;
       }
       if (totalMB > 3000) {
-        log('总内存 ' + Math.round(totalMB) + ' MB 超过 3000，自动回收');
-        await reclaimMemory('自动');
+        await reclaimMemory('自动', { idleOnly: true, max: 1 });
       }
     } catch (e) {
       log('自动回收检查失败: ' + e.message);
@@ -3770,6 +3916,7 @@ app.whenReady().then(() => {
   cleanupStaleUpdateShell();
   restoreUpdateState();
   sweepPendingCleanups();
+  pruneClipBatches();
   buildAppMenu();
   buildTray();
   createMainWindow();

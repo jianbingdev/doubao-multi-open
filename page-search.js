@@ -108,6 +108,37 @@ const SEL_ENTRY = '[data-testid=global-search-icon-entry]';
 const SEL_CLOSE = '[data-testid=search-dialog-close]';
 const SEL_VIEW_ALL = '[data-testid=search-view-all]';
 
+// 关搜索面板的三级兜底：点关闭 → 再点一次 → Escape。
+// 跳转脚本内嵌这段源码，搜索结束/切号用的独立脚本也内嵌同一份，
+// 两处行为必须一致，别各写一套。
+const CLOSE_PANEL_SRC = `const closePanel = async () => {
+    for (let round = 0; round < 3 && one(INPUT); round++) {
+      const c = one(CLOSE);
+      if (c) { try { c.click(); } catch (e) {} }
+      else {
+        try {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+        } catch (e) {}
+      }
+      for (let i = 0; i < 25 && one(INPUT); i++) await sleep(60);
+    }
+    return !one(INPUT);
+  };`;
+
+// 搜索脚本不负责关面板（stage3 还要靠那个列表翻页），搜完由主进程
+// 对每个搜过的账号单独调这个脚本收浮层；切号时也用它兜底。
+const PAGE_CLOSE_PANEL_SCRIPT = `
+(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const one = (s) => document.querySelector(s);
+  const INPUT = ${JSON.stringify(SEL_INPUT)};
+  const CLOSE = ${JSON.stringify(SEL_CLOSE)};
+  ${CLOSE_PANEL_SRC}
+  const panelClosed = await closePanel();
+  return { ok: panelClosed, panelClosed: panelClosed };
+})()
+`;
+
 // 搜索脚本分两阶段，供主进程「搜到一批就推一批」：
 //   stage=1 打开面板 + 填词 + 读「全部」视图首屏（约 11 条）
 //   stage=2 点「消息」查看全部 + 读全量（约 50 条）
@@ -468,19 +499,7 @@ const PAGE_JUMP_SCRIPT = `
   // （深结果会误判 item-gone，或者点到上一轮同一位置的别的消息）。
   // 关面板偶尔会慢/关不掉：连关三轮，还关不掉就明确报 panel-stuck，
   // 别拿着旧面板继续填词，最后误报 stale。
-  const closePanel = async () => {
-    for (let round = 0; round < 3 && one(INPUT); round++) {
-      const c = one(CLOSE);
-      if (c) c.click();
-      else {
-        try {
-          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
-        } catch (e) {}
-      }
-      for (let i = 0; i < 25 && one(INPUT); i++) await sleep(60);
-    }
-    return !one(INPUT);
-  };
+  ${CLOSE_PANEL_SRC}
   if (!(await closePanel())) return { ok: false, why: 'panel-stuck', total: all(ITEM).length };
   if (!alive()) return { ok: false, why: 'superseded' };
   const entry = one(ENTRY);
@@ -682,20 +701,8 @@ const PAGE_JUMP_SCRIPT = `
 
   // 兜底：豆包自己的搜索面板时不时不会自动收起（用户实测「有时候跳转后还开着」）。
   // 放在 landed 判定之后，免得我们自己关面板把「点击被受理」这个信号盖掉。
-  let panelClosed = !one(INPUT);
-  if (!panelClosed) {
-    const c = one(CLOSE);
-    if (c) c.click();
-    await sleep(220);
-    panelClosed = !one(INPUT);
-  }
-  if (!panelClosed) {
-    try {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    } catch (e) {}
-    await sleep(220);
-    panelClosed = !one(INPUT);
-  }
+  // 与搜索结束用的是同一份三级兜底（CLOSE_PANEL_SRC）。
+  const panelClosed = await closePanel();
   return { ok: true, total: items.length, navigated: navigated, panelClosed: panelClosed,
            landed: landed, retried: retried, clickedConnected: clickedConnected,
            by: by, at: finalAt, expanded: expanded, deepPages: deepPages,
@@ -970,6 +977,7 @@ function fillJumpScript(keyword, index, via, sig, opts) {
     .replace('SIG_PLACEHOLDER', () => JSON.stringify(String(sig == null ? '' : sig)))
     .replace('OPTS_PLACEHOLDER', () => JSON.stringify(payload));
 }
+function fillClosePanelScript() { return PAGE_CLOSE_PANEL_SCRIPT; }
 function fillHighlightScript(keyword, fragment) {
   const frags = Array.isArray(fragment) ? fragment : (fragment == null || fragment === '' ? [] : [fragment]);
   return PAGE_HIGHLIGHT_SCRIPT
@@ -1345,9 +1353,9 @@ function normalizeItems(raw, now) {
 
 module.exports = {
   SEL_INPUT, SEL_ITEM, SEL_SECTION, SEL_ENTRY, SEL_CLOSE, SEL_VIEW_ALL, SIG_SEP,
-  PAGE_SEARCH_SCRIPT, PAGE_JUMP_SCRIPT, PAGE_HIGHLIGHT_SCRIPT,
+  PAGE_SEARCH_SCRIPT, PAGE_JUMP_SCRIPT, PAGE_HIGHLIGHT_SCRIPT, PAGE_CLOSE_PANEL_SCRIPT,
   fillSearchScript, fillStage1Script, fillStage2Script, fillStage3Script,
-  fillJumpScript, fillHighlightScript,
+  fillJumpScript, fillHighlightScript, fillClosePanelScript,
   WAIT_STABLE_SRC, LOAD_MORE_SRC, mergeSearchStages, buildSig, bestClause, planSearchQueries, jumpCandidates, buildJumpAttempts, highlightFragments, highlightFragment,
   parseMessageTime, timeWindow, pickBySig, normalizeItems
 };

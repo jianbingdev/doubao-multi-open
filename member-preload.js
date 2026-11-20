@@ -109,23 +109,49 @@ try {
     try { return JSON.parse(raw); } catch (e) { return null; }
   };
 
-  // 页面 -> 主进程（action: copy | download）
+  // 页面 -> 主进程（action: copy | download | copyText）
   window.addEventListener('message', (e) => {
     const d = parsed(e.data);
-    if (!d || !Array.isArray(d.urls) || !d.urls.length) return;
+    if (!d) return;
     const action = d.__dbPick;
+    const urls = Array.isArray(d.urls) ? d.urls : [];
+    const text = typeof d.text === 'string' ? d.text : '';
+
+    if (action === 'copyText') {
+      if (!text.trim()) return;
+      __diag('复制文字请求: ' + text.length + ' 字');
+      ipcRenderer.invoke('text:copy', text)
+        .then((r) => {
+          window.postMessage(JSON.stringify({
+            __dbPickResult: true, action: 'copyText',
+            ok: !!(r && r.ok), chars: (r && r.chars) || 0,
+            error: (r && r.error) || ''
+          }), '*');
+        })
+        .catch((err) => {
+          window.postMessage(JSON.stringify({
+            __dbPickResult: true, action: 'copyText', ok: false,
+            error: (err && err.message) ? err.message : String(err)
+          }), '*');
+        });
+      return;
+    }
+
+    if (!urls.length) return;
     if (action !== 'copy' && action !== 'download') return;
 
-    __diag('图片' + (action === 'copy' ? '复制' : '下载') + '请求: ' + d.urls.length + ' 张');
-    ipcRenderer.invoke('images:' + action, d.urls)
+    __diag('图片' + (action === 'copy' ? '复制' : '下载') + '请求: ' + d.urls.length + ' 张' +
+      (action === 'copy' && d.text ? ' + 文字 ' + String(d.text).length + ' 字' : ''));
+    ipcRenderer.invoke('images:' + action, d.urls, action === 'copy' ? d.text : '')
       .then((r) => {
-        __diag('图片' + action + '结果: ' + JSON.stringify(r && { ok: r.ok, count: r.count, error: r.error }));
+        __diag('图片' + action + '结果: ' + JSON.stringify(r && { ok: r.ok, count: r.count, text: r.text, error: r.error }));
         window.postMessage(JSON.stringify({
           __dbPickResult: true,
           action: action,
           ok: !!(r && r.ok),
           count: (r && r.count) || 0,
           failed: (r && r.failed) || 0,
+          text: !!(r && r.text),
           dir: (r && r.dir) || '',
           error: (r && r.error) || ''
         }), '*');

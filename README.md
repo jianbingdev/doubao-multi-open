@@ -5,7 +5,7 @@
 > **一个窗口，管住所有豆包账号。**
 > 每个账号一条独立会话、一条常驻页面，切号只是把页面显示出来 —— 毫秒级、不重载、不丢对话。
 
-[![version](https://img.shields.io/badge/version-4.2.7-blue?style=flat-square)](../../releases)
+[![version](https://img.shields.io/badge/version-4.2.8-blue?style=flat-square)](../../releases)
 [![platform](https://img.shields.io/badge/platform-Windows-lightgrey?style=flat-square)](#下载即用)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 ![search](https://img.shields.io/badge/聚合搜索-✓-blue?style=flat-square)
@@ -263,6 +263,10 @@ doubao-multi-open\
 ├─ main.js               主进程(视图池/会话隔离/托盘/IPC/状态检测/自动更新)
 ├─ page-search.js        聚合搜索注入脚本(搜全部账号/跳转/高亮)
 ├─ search-cache.js       搜索本地缓存(纯函数,可单测)
+├─ clip-store.js         剪贴板临时图片: 批次目录 + 保留策略清理(可单测)
+├─ clip-clipboard.js     文件 + 文字混合写剪贴板(PowerShell 脚本,可单测)
+├─ gen-state.js          生成状态文案判定: 后台任务/完成/失败(可单测)
+├─ reclaim-plan.js       自动内存回收: 只挑长时间没用的账号(可单测)
 ├─ download-name.js      下载自动命名(纯函数,可单测)
 ├─ account-order.js      账号排序(纯函数,可单测)
 ├─ preload.js            IPC 安全桥(主窗口)

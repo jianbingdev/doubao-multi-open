@@ -552,6 +552,7 @@ const updSrcSave = document.getElementById('updSrcSave');
 
 let appVersion = '';
 let appVersionLabel = '';
+let appPackaged = false;
 let currentUpdateUrl = '';// idle | checking | none | ready | downloading | downloaded | applying
 let updPhase = 'idle';
 
@@ -632,6 +633,23 @@ function setBadge(text, tip, isNew) {
 function badgeVersion(tip, isNew) {
   const label = appVersionLabel || (appVersion ? 'v' + appVersion : 'v—');
   setBadge(label, tip || ('当前版本 ' + label + '，点击检查更新'), !!isNew);
+}
+
+// 后台自动检测更新：只在打包版跑，启动 8 秒后查一次，之后每 6 小时一次。
+// 只把版本号变红，不弹窗；失败静默（断网/源不可用不打扰）。
+function autoCheckUpdate() {
+  try {
+    if (!appPackaged) return;
+    if (updPhase === 'checking' || updPhase === 'downloading' || updPhase === 'applying') return;
+    window.api.updateCheck().then((r) => {
+      if (!r || !r.ok || r.downloading) return;
+      if (r.hasNew) {
+        badgeVersion('发现新版本 v' + r.latest + '，点击查看更新', true);
+      } else if (updPhase === 'idle' || updPhase === 'none') {
+        badgeVersion();   // 远端已经追平：清掉红点
+      }
+    }).catch(() => {});
+  } catch (e) {}
 }
 function closeUpdateModal() {
   if (updPhase === 'applying') return; // 已经在重启更新, 不许关
@@ -1776,6 +1794,20 @@ let openDeleteConfirm = () => {};
 // ============ 更新日志（只记新增 / 优化 / 修复）============
 const CHANGELOG = [
   {
+    v: '4.2.8',
+    items: [
+      ['new', '启动后自动检测更新：打包版 8 秒后查一次、之后每 6 小时一次，发现新版本时侧栏版本号变红（只提示，不弹窗）'],
+      ['new', '图片复制支持「连同消息文字一起复制」：选中图片后，关联文字气泡的左侧浮出「文」复选框（不压文字），点一下即可连文字一起复制；无关文字不会出现复选框'],
+      ['imp', '混合复制后直接提示粘贴方式（Ctrl+V 贴图、Ctrl+Shift+V 贴文字），文字行新增「只复制文字」一键复制'],
+      ['imp', '内存回收更克制：只清空闲 ≥1 小时、2 小时内没清过的账号（每次 1 个），不再每 5 分钟把常用页面缓存清冷；切到长时间没用的账号前先唤醒一次'],
+      ['fix', '图文在同一条消息时，「文」复选框改贴文字块左侧（图片下方），不再压到图片勾选框；文字很短也不会跑远'],
+      ['fix', '打开图片预览或其他弹窗时，图片/文字复选框和工具条自动收起，不再浮在预览页上'],
+      ['fix', '搜索结束后自动收起各账号的豆包搜索浮层，切号不再被它挡住；跳转仍会自己开面板重搜'],
+      ['fix', '图片复制每批写独立目录，不再因上一批被豆包/微信/WPS 占用而报 EPERM；旧批次自动清理（最多 4 批 / 150 MB / 3 天）'],
+      ['fix', '视频生成失败后侧栏不再一直转圈：识别「视频生成失败，生成额度未扣除」等失败文案，立即收尾且不误标「已完成」']
+    ]
+  },
+  {
     v: '4.2.7',
     items: [
       ['new', '聚合搜索本地缓存（默认关闭，搜索页可开）：重搜同一个词先显示缓存，只把新消息实时补进来，历史消息不重复加载'],
@@ -1992,10 +2024,16 @@ window.api.onMenuCheckUpdate(() => openUpdateModal());
   try {
     const info = await window.api.appInfo();
     appVersion = (info && info.version) || '';
+    appPackaged = !!(info && info.packaged);
     appVersionLabel = (info && info.versionLabel) || (appVersion ? 'v' + appVersion : '');
     currentUpdateUrl = (info && info.updateUrl) || '';
     if (appVersionLabel) badgeVersion();
   } catch (e) {}
+  // 打包版才自动查（开发版查了会诱导把更新包铺进源码目录）
+  if (appPackaged) {
+    setTimeout(autoCheckUpdate, 8000);
+    setInterval(autoCheckUpdate, 6 * 60 * 60 * 1000);
+  }
 })();
 
 refresh();

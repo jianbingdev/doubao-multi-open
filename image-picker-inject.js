@@ -18,6 +18,7 @@
     bar: null,
     layer: null,
     busy: false,
+    textBoxes: new Map(),  // 文字元素 -> { box, on }（选了图片后才按关联关系出现）
     observer: null
   };
   window.__DB_PICK__ = S;
@@ -78,6 +79,7 @@
         <span id="__db_pick_cnt" style="white-space:nowrap;flex:1;margin-right:2px">已选 0 张</span>
         <button id="__db_pick_copy" type="button" title="复制到剪贴板" style="all:unset;cursor:pointer;padding:5px 12px;border-radius:999px;background:#4F86F7;color:#fff;font-weight:600;white-space:nowrap">复制</button>
         <button id="__db_pick_download" type="button" title="下载到下载目录" style="all:unset;cursor:pointer;padding:5px 12px;border-radius:999px;background:rgba(255,255,255,.14);color:#fff;font-weight:600;white-space:nowrap">下载</button>
+        <button id="__db_pick_copytext" type="button" title="只把关联文字复制到剪贴板" style="all:unset;display:none;cursor:pointer;padding:3px 8px;border-radius:999px;background:rgba(255,255,255,.14);color:#fff;font-size:11px;white-space:nowrap">只复制文字</button>
         <button id="__db_pick_clear" type="button" title="清空选择" style="all:unset;cursor:pointer;width:22px;height:22px;line-height:22px;text-align:center;border-radius:999px;background:rgba(255,255,255,.14);font-size:14px">×</button>
       </div>
       <div style="font-size:11px;color:rgba(255,255,255,.5);text-align:center;white-space:nowrap">Ctrl+C 复制 · 下载存到下载目录</div>`;
@@ -96,6 +98,9 @@
     bar.querySelector('#__db_pick_clear').addEventListener('click', (e) => {
       e.preventDefault(); e.stopPropagation(); clearSel();
     });
+    bar.querySelector('#__db_pick_copytext').addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation(); doCopyText();
+    });
     S.bar = bar;
     return bar;
   }
@@ -106,6 +111,12 @@
     bar.style.display = n ? 'flex' : 'none';
     const cnt = bar.querySelector('#__db_pick_cnt');
     if (cnt) cnt.textContent = '已选 ' + n + ' 张';
+    // 文字复选框不再放在工具条里，而是浮到关联文字块的左上角（见 refreshTextBoxes）。
+    // 只有选了图片、且找得到关联文字时，「只复制文字」才出现。
+    const textBtn = bar.querySelector('#__db_pick_copytext');
+    if (textBtn) textBtn.style.display = (n && assocTextRoots().length) ? '' : 'none';
+    if (!n) clearTextBoxes();
+    else refreshTextBoxes();
   }
 
   // ---------- 提示气泡 ----------
@@ -161,6 +172,30 @@
     } catch (e) { return false; }
   }
 
+  // 整页级开关：打开图片预览 / 弹窗，或聊天输入框被卸载时，把整层复选框和工具条收起来。
+  // 我们的浮层 z-index 是顶格，不主动收会盖在豆包自己的预览页上（用户截图反馈）。
+  function setPickerVisible(show) {
+    try { if (S.layer) S.layer.style.display = show ? '' : 'none'; } catch (e) {}
+    try { if (S.bar) S.bar.style.display = (show && S.sel.size) ? 'flex' : 'none'; } catch (e) {}
+  }
+
+  function overlayCoversScreen() {
+    try {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const all = document.querySelectorAll('[class*="image-preview" i], [role="dialog"], [aria-modal="true"]');
+      for (const el of all) {
+        if (S.layer && S.layer.contains(el)) continue;
+        if (S.bar && S.bar.contains(el)) continue;
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+        if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width >= vw * 0.7 && r.height >= vh * 0.7) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
   function syncPositions() {
     const vw = window.innerWidth, vh = window.innerHeight;
 
@@ -171,13 +206,22 @@
     // 不能整块 display:none（用户要求：超过线的部分消失，没超过的还展示出来）。
     let inputTop = Infinity;
     const ed = getEditor();   // 用缓存的，不再每次全文档查
+    let editorVisible = false;
     if (ed) {
       try {
         const frame = ed.closest('[class*="rounded-dbx"]') || ed.closest('.guidance-input-surface') || ed;
-        const t = frame.getBoundingClientRect().top;
+        const er = frame.getBoundingClientRect();
+        editorVisible = er.width > 0 && er.height > 0 && er.bottom > 0 && er.top < vh;
+        const t = er.top;
         if (t > 120) inputTop = t;
       } catch (e) {}
     }
+    // 预览页/弹窗：聊天输入框可能还在也可能被盖住，两条都算
+    if (!editorVisible || overlayCoversScreen()) {
+      setPickerVisible(false);
+      return;
+    }
+    setPickerVisible(true);
 
     for (const [img, rec] of S.boxes) {
       if (!img.isConnected) {
@@ -203,6 +247,24 @@
         continue;
       }
 
+      // 被预览页/弹窗盖住时不能再浮在上面：取图片可见区域中心做命中测试，
+      // 最上层元素必须还在这条消息块里（豆包自己的点击包裹层也算）。
+      try {
+        const vy0 = Math.max(r.top, topLimit);
+        const vy1 = inputTop === Infinity ? Math.min(r.bottom, vh) : Math.min(r.bottom, inputTop, vh);
+        const cx = Math.round(r.left + Math.min(30, r.width / 2));
+        const cy = Math.round(vy0 + Math.max(1, vy1 - vy0) / 2);
+        const hit = document.elementFromPoint(cx, cy);
+        const ours = hit && ((S.layer && S.layer.contains(hit)) || (S.bar && S.bar.contains(hit)));
+        const scope = img.closest('[data-testid="message-block-container"]') ||
+          img.closest('[data-message-id]') || img.parentElement;
+        if (!hit || (!ours && (!scope || !scope.contains(hit)))) {
+          rec.box.style.display = 'none';
+          rec.hl.style.display = 'none';
+          continue;
+        }
+      } catch (e) {}
+
       // 裁掉超出上下边界的部分
       const topCut = Math.max(0, topLimit - r.top);
       const botCut = inputTop === Infinity ? 0 : Math.max(0, r.bottom - inputTop);
@@ -227,6 +289,48 @@
         rec.hl.style.clipPath = 'inset(' + topCut + 'px 0px ' + botCut + 'px 0px)';
       } else {
         rec.hl.style.display = 'none';
+      }
+    }
+
+    // ---- 文字复选框：放到消息气泡左侧；气泡已经被裁掉/滚出去就隐藏 ----
+    for (const [root, rec] of S.textBoxes) {
+      if (!root.isConnected) {
+        try { rec.box.remove(); } catch (e) {}
+        S.textBoxes.delete(root);
+        continue;
+      }
+      const rr = root.getBoundingClientRect();
+      // 消息行常常是整行宽（justify-end），直接贴行首会跑到屏幕最左边。
+      // 真正要贴的是里面那个文字气泡：找"文字量接近整条消息、但明显更窄"的后代。
+      if (!rec.anchor || !rec.anchor.isConnected) rec.anchor = bubbleOf(root);
+      const ar = rec.anchor.getBoundingClientRect();
+      const sc = rec.scroller || (rec.scroller = findScroller(root));
+      let topLimit = 0;
+      if (sc) {
+        try { topLimit = sc.getBoundingClientRect().top; } catch (e) {}
+      }
+      const boxTop = Math.max(ar.top + GAP, topLimit + 2);
+      let visible = ar.width > 0 && ar.bottom > topLimit && ar.left < vw &&
+        (inputTop === Infinity || boxTop + 22 <= inputTop);
+      try {
+        if (visible) {
+          const hx = Math.round(ar.left + Math.min(24, Math.max(1, ar.width / 2)));
+          const hy = Math.round(Math.min(Math.max(ar.top + 10, topLimit + 2),
+            (inputTop === Infinity ? vh : inputTop) - 2));
+          const hit = document.elementFromPoint(hx, hy);
+          const ours = hit && ((S.layer && S.layer.contains(hit)) || (S.bar && S.bar.contains(hit)));
+          const scope = root.closest('[data-testid="message-block-container"]') || root.parentElement || root;
+          if (!hit || (!ours && !scope.contains(hit))) visible = false;
+        }
+      } catch (e) {}
+      rec.box.style.display = visible ? 'flex' : 'none';
+      if (visible) {
+        // 统一放文字左边（用户要求不压文字）；左边实在没空间才贴内侧。
+        // 不再区分用户/助手：助手消息贴气泡内侧会正好压住图片左上角的勾选框。
+        let boxLeft = ar.left - GAP - 22;
+        if (boxLeft < 4) boxLeft = ar.left + GAP;
+        rec.box.style.left = Math.round(boxLeft) + 'px';
+        rec.box.style.top = Math.round(boxTop) + 'px';
       }
     }
   }
@@ -357,6 +461,7 @@
   function scan() {
     const imgs = document.querySelectorAll('img');
     for (let i = 0; i < imgs.length; i++) decorate(imgs[i]);
+    if (S.sel.size) refreshTextBoxes();
     syncPositions();
   }
   function scheduleScan() {
@@ -389,12 +494,264 @@
     }
   }
 
+  // ---------- 消息文字（勾选「连同消息文字」时一起复制）----------
+  // 只复制「选中的图片所在消息」的正文，不搬整页文字；没有标准消息容器时
+  // 向上找第一个带文字、不超宽的祖先，找不到就返回空（不瞎猜）。
+  const NOISE_LINE = /^(复制|下载|分享|编辑|删除|重新生成|赞|点赞|踩|点踩|保存|展开|收起|查看大图|查看原图|图片|上传|发送|停止|更多|已复制.*)$/;
+
+  function textBlockOf(root) {
+    if (!root) return '';
+    let block = null;
+    try {
+      const sel = '[data-testid="message_text_content"], [class*="flow-markdown-body" i]';
+      block = (root.matches && root.matches(sel)) ? root : root.querySelector(sel);
+    } catch (e) {}
+    const raw = String((block || root).innerText || '');
+    const lines = raw.split('\n').map((s) => s.trim()).filter((s) => s && !NOISE_LINE.test(s));
+    return lines.join('\n').trim();
+  }
+
+  function messageRoot(img) {
+    try {
+      const direct = img.closest('[data-message-id]');
+      if (direct) return direct;
+      const block = img.closest('[data-testid="message_text_content"], [class*="flow-markdown-body" i], [class*="message-content" i]');
+      if (block) return block;
+    } catch (e) {}
+    let el = img.parentElement;
+    for (let d = 0; d < 10 && el && el !== document.body; d++) {
+      try {
+        if (isInputZone(el)) break;
+        const txt = String(el.innerText || '').trim();
+        const r = el.getBoundingClientRect();
+        if (txt.length >= 2 && txt.length <= 6000 && r.width <= window.innerWidth * 0.95) return el;
+      } catch (e) {}
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // 图片单独成一条消息、文字在下一条用户消息里时（实测豆包常见布局：
+  // 图片消息正文长度为 0，提示词是紧随其后的另一条 send_message），
+  // 找相邻的用户消息。只往两侧看各 3 条，碰到助手消息就停，隔太远也不拿。
+  function isUserBlock(el) {
+    try { return !!el.querySelector('[data-testid="send_message"]'); } catch (e) { return false; }
+  }
+
+  function blockText(block) {
+    if (!block) return '';
+    let root = null;
+    try { root = block.querySelector('[data-testid="message_content"]'); } catch (e) {}
+    return textBlockOf(root || block);
+  }
+
+  // 消息行往往是 w-full（justify-end），文字气泡只是其中一段。
+  // 浮框要贴气泡，不能贴整行：找"文字量接近整条消息、宽度明显更窄"的后代，
+  // 取层级最浅的那个（气泡外层），找不到就退回原元素。
+  function bubbleOf(root) {
+    try {
+      const rr = root.getBoundingClientRect();
+      const total = String(root.innerText || '').trim().length;
+      if (!total) return root;
+      let best = null;
+      const all = root.querySelectorAll('div');
+      for (const el of all) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 160 || r.width > rr.width - 80) continue;
+        const len = String(el.innerText || '').trim().length;
+        if (len < total * 0.85) continue;
+        let depth = 0;
+        let p = el;
+        while (p && p !== root) { depth++; p = p.parentElement; }
+        if (!best || depth < best.depth) best = { el: el, depth: depth };
+      }
+      return best ? best.el : root;
+    } catch (e) { return root; }
+  }
+
+  function adjacentUserRoot(block) {
+    if (!block) return null;
+    let blocks = [];
+    try { blocks = Array.from(document.querySelectorAll('[data-testid="message-block-container"]')); } catch (e) {}
+    if (!blocks.length) {
+      try { blocks = Array.from(document.querySelectorAll('[data-message-id]')); } catch (e) {}
+    }
+    const idx = blocks.indexOf(block) >= 0 ? blocks.indexOf(block) : blocks.findIndex((b) => b.contains(block));
+    if (idx < 0) return null;
+    const base = block.getBoundingClientRect();
+    for (const off of [1, -1, 2, -2, 3, -3]) {
+      const b = blocks[idx + off];
+      if (!b) continue;
+      const txt = blockText(b);
+      if (!txt) continue;                 // 纯图片 / 还没渲染的空消息，继续看下一条
+      if (!isUserBlock(b)) return null;   // 碰到助手消息：属于另一轮，不再越过
+      try {
+        const r = b.getBoundingClientRect();
+        const gap = r.top > base.bottom ? r.top - base.bottom : (base.top > r.bottom ? base.top - r.bottom : 0);
+        if (gap > 600) return null;
+      } catch (e) {}
+      let root = null;
+      try { root = b.querySelector('[data-testid="message_content"]'); } catch (e) {}
+      return textElementOf(root || b, null) || root || b;
+    }
+    return null;
+  }
+
+  // 消息里可能既有图又有字。浮框要贴"字"本身，不能贴整条消息/图片卡片：
+  // 优先取离这张图最近的文字块（图片下方的说明/提示词最合适），没有就退第一条文字块。
+  function textElementOf(root, img) {
+    if (!root) return null;
+    const sel = '[data-testid="message_text_content"], [class*="flow-markdown-body" i]';
+    try {
+      if (root.matches && root.matches(sel)) return root;
+      const all = Array.from(root.querySelectorAll(sel));
+      if (!all.length) return root;
+      if (!img) return all[0];
+      const ir = img.getBoundingClientRect();
+      let best = null;
+      for (const el of all) {
+        const r = el.getBoundingClientRect();
+        const d = r.top >= ir.bottom ? r.top - ir.bottom : (ir.top >= r.bottom ? ir.top - r.bottom : 0);
+        const score = d + (r.top < ir.top ? 2000 : 0);   // 同距离时优先图片下方
+        if (!best || score < best.score) best = { el: el, score: score };
+      }
+      return best ? best.el : all[0];
+    } catch (e) { return root; }
+  }
+
+  // 某张图片关联的文字元素：同一消息有字就用；没有就借相邻用户消息。
+  function assocTextRoot(img) {
+    const root = messageRoot(img);
+    if (root) {
+      const te = textElementOf(root, img);
+      if (te && textBlockOf(te)) return te;
+    }
+    let block = null;
+    try { block = img.closest('[data-testid="message-block-container"]'); } catch (e) {}
+    if (!block) { try { block = img.closest('[data-message-id]'); } catch (e) {} }
+    return adjacentUserRoot(block);
+  }
+
+  function assocTextRoots() {
+    const roots = [];
+    for (const [img] of S.boxes) {
+      if (!img.isConnected) continue;
+      const url = img.currentSrc || img.src || '';
+      if (!S.sel.has(url)) continue;
+      const root = assocTextRoot(img);
+      if (root && roots.indexOf(root) < 0 && textBlockOf(root)) roots.push(root);
+    }
+    return roots;
+  }
+
+  // ---------- 文字复选框（浮在关联文字块左上角，选了图片才出现）----------
+  function paintTextBox(rec, on) {
+    rec.on = on;
+    rec.box.style.background = on ? '#4F86F7' : 'rgba(255,255,255,.92)';
+    rec.box.style.borderColor = on ? '#4F86F7' : 'rgba(0,0,0,.35)';
+    rec.box.style.borderStyle = on ? 'solid' : 'dashed';
+    rec.box.style.color = on ? '#fff' : '#333';
+    rec.box.textContent = on ? '✓' : '文';
+    rec.box.style.opacity = on ? '1' : '0.75';
+  }
+
+  function clearTextBoxes() {
+    for (const [, rec] of S.textBoxes) {
+      try { rec.box.remove(); } catch (e) {}
+    }
+    S.textBoxes.clear();
+  }
+
+  function refreshTextBoxes() {
+    if (!S.sel.size) { clearTextBoxes(); return; }
+    const roots = assocTextRoots();
+    // 不再关联的文字块，连复选框一起撤掉
+    for (const [root, rec] of Array.from(S.textBoxes)) {
+      if (roots.indexOf(root) < 0) {
+        try { rec.box.remove(); } catch (e) {}
+        S.textBoxes.delete(root);
+      }
+    }
+    const layer = ensureLayer();
+    for (const root of roots) {
+      if (S.textBoxes.has(root)) continue;
+      const box = document.createElement('div');
+      box.className = '__db_pick_textbox';
+      css(box, {
+        position: 'fixed', width: '22px', height: '22px', borderRadius: '7px',
+        cursor: 'pointer', pointerEvents: 'auto',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: 'rgba(255,255,255,.92)', border: '1.5px dashed rgba(0,0,0,.35)',
+        boxShadow: '0 2px 8px rgba(0,0,0,.18)',
+        transition: 'opacity .12s ease, background .12s ease, border-color .12s ease',
+        opacity: '0.75',
+        font: '700 12px/1 -apple-system,"Microsoft YaHei",sans-serif', color: '#333'
+      });
+      box.textContent = '文';
+      box.title = '勾上后复制图片时会带上这段文字';
+      layer.appendChild(box);
+      const rec = { box: box, on: false, anchor: null };
+      box.addEventListener('mouseenter', () => { box.style.opacity = '1'; });
+      box.addEventListener('mouseleave', () => { if (!rec.on) box.style.opacity = '0.75'; });
+      ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'dblclick'].forEach((t) => {
+        box.addEventListener(t, (e) => { e.stopPropagation(); e.preventDefault(); }, true);
+      });
+      box.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const on = !rec.on;
+        paintTextBox(rec, on);
+        const t = textBlockOf(root);
+        tip(on ? '复制图片时会带上这段文字（约 ' + t.length + ' 字）' : '这段文字不随图片复制了', false);
+        syncPositions();
+      });
+      S.textBoxes.set(root, rec);
+      paintTextBox(rec, false);
+    }
+    syncPositions();
+  }
+
+  function textOfRoots(roots) {
+    const out = [];
+    const sorted = roots.slice().sort((a, b) => ((a.compareDocumentPosition(b) & 4) ? -1 : 1));
+    for (const root of sorted) {
+      const t = textBlockOf(root);
+      if (t && out.indexOf(t) < 0) out.push(t);
+    }
+    return out.join('\n\n').slice(0, 20000);
+  }
+
+  // 复制图片时：只带用户勾过的文字块
+  function collectCheckedText() {
+    const roots = [];
+    for (const [root, rec] of S.textBoxes) {
+      if (rec.on && root.isConnected) roots.push(root);
+    }
+    return textOfRoots(roots);
+  }
+
+  // 「只复制文字」按钮：带全部关联文字，不要求勾选
+  function collectAssocText() {
+    return textOfRoots(assocTextRoots());
+  }
+
   async function doCopy() {
     if (S.busy || !S.sel.size) return;
     S.busy = true;
     const urls = await Promise.all(Array.from(S.sel).map(toTransferable));
-    tip('正在准备 ' + urls.length + ' 张图片…');
-    send({ __dbPick: 'copy', urls });
+    const text = collectCheckedText();
+    tip('正在准备 ' + urls.length + ' 张图片' + (text ? ' + 文字' : '') + '…');
+    send({ __dbPick: 'copy', urls, text });
+  }
+
+  // 只复制文字：不动图片，也不清空选择（方便随后再单独复制图片）
+  function doCopyText() {
+    if (S.busy) return;
+    const text = collectAssocText();
+    if (!text) { tip('这几条消息里没找到可复制的文字', true); return; }
+    S.busy = true;
+    tip('正在复制文字…');
+    send({ __dbPick: 'copyText', text });
   }
 
   async function doDownload() {
@@ -439,11 +796,18 @@
     if (!d || !d.__dbPickResult) return;
     S.busy = false;
     const isDownload = d.action === 'download';
+    if (d.action === 'copyText') {
+      if (d.ok) tip('已复制文字' + (d.chars ? '（' + d.chars + ' 字）' : '') + '，去目标处 Ctrl+V');
+      else tip('复制文字失败：' + (d.error || '未知错误'), true);
+      return;
+    }
     if (d.ok) {
       if (isDownload) {
         tip('已下载 ' + d.count + ' 张图片到下载目录' + (d.failed ? '（失败 ' + d.failed + ' 张）' : ''));
       } else {
-        tip('已复制 ' + d.count + ' 张图片，去目标处 Ctrl+V' + (d.failed ? '（失败 ' + d.failed + ' 张）' : ''));
+        tip('已复制 ' + d.count + ' 张图片' + (d.text ? ' + 文字' : '') + '，去目标处 ' +
+          (d.text ? 'Ctrl+V 贴图、Ctrl+Shift+V 贴文字' : 'Ctrl+V') +
+          (d.failed ? '（失败 ' + d.failed + ' 张）' : ''));
       }
       clearSel();
     } else {
